@@ -36,6 +36,56 @@ logging.basicConfig(
 log = logging.getLogger("playtimed")
 
 
+# Terminal colors (disabled if not a tty)
+class Colors:
+    """ANSI color codes for terminal output."""
+    _enabled = sys.stdout.isatty()
+
+    RESET = '\033[0m' if _enabled else ''
+    BOLD = '\033[1m' if _enabled else ''
+    DIM = '\033[2m' if _enabled else ''
+
+    RED = '\033[31m' if _enabled else ''
+    GREEN = '\033[32m' if _enabled else ''
+    YELLOW = '\033[33m' if _enabled else ''
+    BLUE = '\033[34m' if _enabled else ''
+    MAGENTA = '\033[35m' if _enabled else ''
+    CYAN = '\033[36m' if _enabled else ''
+    WHITE = '\033[37m' if _enabled else ''
+
+    # Semantic colors
+    @classmethod
+    def ok(cls, text): return f"{cls.GREEN}{text}{cls.RESET}"
+    @classmethod
+    def warn(cls, text): return f"{cls.YELLOW}{text}{cls.RESET}"
+    @classmethod
+    def error(cls, text): return f"{cls.RED}{text}{cls.RESET}"
+    @classmethod
+    def info(cls, text): return f"{cls.CYAN}{text}{cls.RESET}"
+    @classmethod
+    def dim(cls, text): return f"{cls.DIM}{text}{cls.RESET}"
+    @classmethod
+    def bold(cls, text): return f"{cls.BOLD}{text}{cls.RESET}"
+    @classmethod
+    def header(cls, text): return f"{cls.BOLD}{cls.CYAN}{text}{cls.RESET}"
+
+
+def print_table(headers: list[str], rows: list[list[str]], col_widths: list[int] = None):
+    """Print a formatted table with headers."""
+    if not col_widths:
+        col_widths = [max(len(str(h)), max((len(str(r[i])) for r in rows), default=0)) + 2
+                      for i, h in enumerate(headers)]
+
+    # Header
+    header_line = ''.join(f"{Colors.bold(h):<{w}}" for h, w in zip(headers, col_widths))
+    print(header_line)
+    print(Colors.dim('─' * sum(col_widths)))
+
+    # Rows
+    for row in rows:
+        print(''.join(f"{str(c):<{w}}" for c, w in zip(row, col_widths)))
+
+
 @dataclass
 class AppSession:
     """Tracks a single app usage session."""
@@ -725,9 +775,56 @@ class ClaudeDaemon:
         log.info("playtimed shutdown complete")
 
 
+def _get_user_status_row(db, user: str) -> dict:
+    """Get status data for a single user."""
+    total_used, gaming_used = db.get_time_used_today(user)
+
+    limits = db.get_user_limits(user)
+    if limits:
+        gaming_limit = limits['gaming_limit'] * 60
+        total_limit = limits['daily_total'] * 60
+    else:
+        gaming_limit = 120 * 60
+        total_limit = 180 * 60
+
+    gaming_remaining = max(0, gaming_limit - gaming_used)
+    total_remaining = max(0, total_limit - total_used)
+
+    # Calculate percentage used
+    gaming_pct = int((gaming_used / gaming_limit * 100)) if gaming_limit else 0
+    total_pct = int((total_used / total_limit * 100)) if total_limit else 0
+
+    return {
+        'user': user,
+        'gaming_used': format_duration(gaming_used),
+        'gaming_remaining': format_duration(gaming_remaining),
+        'gaming_pct': gaming_pct,
+        'total_used': format_duration(total_used),
+        'total_remaining': format_duration(total_remaining),
+        'total_pct': total_pct,
+    }
+
+
+def _progress_bar(pct: int, width: int = 10) -> str:
+    """Create a colored progress bar."""
+    filled = int(width * pct / 100)
+    empty = width - filled
+
+    # Color based on usage
+    if pct >= 90:
+        color = Colors.RED
+    elif pct >= 70:
+        color = Colors.YELLOW
+    else:
+        color = Colors.GREEN
+
+    bar = f"{color}{'█' * filled}{Colors.RESET}{Colors.DIM}{'░' * empty}{Colors.RESET}"
+    return f"[{bar}]"
+
+
 def cmd_status(args):
-    """Show status for current user."""
-    user = getattr(args, 'user', None) or os.environ.get("USER", "unknown")
+    """Show status for user(s)."""
+    user = getattr(args, 'user', None)
     db_path = getattr(args, 'db', DEFAULT_DB_PATH)
 
     try:
@@ -737,29 +834,38 @@ def cmd_status(args):
         print("Try: sudo playtimed status", file=sys.stderr)
         sys.exit(1)
 
-    # Get time used from database
-    total_used, gaming_used = db.get_time_used_today(user)
-
-    # Get limits from database
-    limits = db.get_user_limits(user)
-    if limits:
-        gaming_limit = limits['gaming_limit'] * 60
-        total_limit = limits['daily_total'] * 60
+    if user:
+        users = [user]
     else:
-        gaming_limit = 120 * 60  # default 2 hours
-        total_limit = 180 * 60  # default 3 hours
+        users = db.get_all_monitored_users()
+        if not users:
+            print("No monitored users configured.")
+            print(f"Add users with: {Colors.info('sudo playtimed user add <username>')}")
+            return
 
-    gaming_remaining = max(0, gaming_limit - gaming_used)
-    total_remaining = max(0, total_limit - total_used)
+    print(Colors.header(f"📊 Screen Time Status") + f" - {date.today().isoformat()}")
+    print()
+    print(f"{Colors.bold('User'):<20} {Colors.bold('Gaming'):<12} {'Progress':<14} {Colors.bold('Total'):<12} {'Progress':<14}")
+    print(Colors.dim("─" * 70))
 
-    print(f"📊 Screen Time Status for {user}")
-    print(f"   Date: {date.today().isoformat()}")
+    for u in users:
+        row = _get_user_status_row(db, u)
+        gaming_bar = _progress_bar(row['gaming_pct'])
+        total_bar = _progress_bar(row['total_pct'])
+
+        # Color percentage based on usage
+        g_pct = row['gaming_pct']
+        t_pct = row['total_pct']
+        g_pct_str = Colors.error(f"{g_pct:>3}%") if g_pct >= 90 else Colors.warn(f"{g_pct:>3}%") if g_pct >= 70 else f"{g_pct:>3}%"
+        t_pct_str = Colors.error(f"{t_pct:>3}%") if t_pct >= 90 else Colors.warn(f"{t_pct:>3}%") if t_pct >= 70 else f"{t_pct:>3}%"
+
+        print(f"{Colors.bold(row['user']):<20} {row['gaming_used']:<12} {gaming_bar} {g_pct_str}  {row['total_used']:<12} {total_bar} {t_pct_str}")
+
     print()
-    print(f"   Gaming: {format_duration(gaming_used)} used")
-    print(f"           {format_duration(gaming_remaining)} remaining")
-    print()
-    print(f"   Total:  {format_duration(total_used)} used")
-    print(f"           {format_duration(total_remaining)} remaining")
+    print(Colors.dim("Remaining:"))
+    for u in users:
+        row = _get_user_status_row(db, u)
+        print(f"  {row['user']}: Gaming {Colors.ok(row['gaming_remaining'])}, Total {Colors.ok(row['total_remaining'])}")
 
 
 def cmd_maintenance(args):
@@ -820,16 +926,33 @@ def cmd_patterns(args):
             print("No patterns configured.")
             return
 
-        print(f"{'ID':<4} {'State':<12} {'Category':<10} {'Owner':<10} {'Name':<18} {'Pattern':<25} {'Runs':<5} {'Runtime':<8}")
-        print("-" * 105)
+        print(Colors.header("Process Patterns"))
+        print()
+        print(f"{Colors.bold('ID'):<12} {Colors.bold('State'):<20} {Colors.bold('Category'):<18} {Colors.bold('Owner'):<10} {Colors.bold('Name'):<18} {Colors.bold('Runs'):<8} {Colors.bold('Runtime'):<10}")
+        print(Colors.dim("─" * 95))
+
+        state_colors = {
+            'active': Colors.GREEN,
+            'discovered': Colors.YELLOW,
+            'ignored': Colors.DIM,
+            'disallowed': Colors.RED,
+        }
+
         for p in patterns:
             state = p.get('monitor_state', 'active')
             category = p.get('category') or '-'
             owner = p.get('owner') or '*'
             runs = p.get('unique_pid_count', 0)
             runtime = format_runtime(p.get('total_runtime_seconds', 0))
-            enabled = "" if p['enabled'] else " (disabled)"
-            print(f"{p['id']:<4} {state:<12} {category:<10} {owner:<10} {p['name']:<18} {p['pattern'][:24]:<25} {runs:<5} {runtime:<8}{enabled}")
+            enabled = "" if p['enabled'] else Colors.dim(" (off)")
+
+            state_color = state_colors.get(state, '')
+            state_str = f"{state_color}{state}{Colors.RESET}"
+
+            print(f"{p['id']:<4} {state_str:<20} {category:<10} {owner:<10} {p['name']:<18} {runs:<8} {runtime:<10}{enabled}")
+
+        print()
+        print(Colors.dim(f"Pattern details: playtimed patterns show <id>"))
 
     elif args.action == "add":
         pattern_id = db.add_pattern(
@@ -870,23 +993,27 @@ def cmd_discover(args):
         # Show discovered patterns awaiting review
         discovered = db.get_patterns_by_state('discovered')
         if not discovered:
-            print("No discovered patterns awaiting review.")
-            print("\nRun the daemon to discover high-CPU processes automatically.")
+            print(Colors.info("No discovered patterns awaiting review."))
+            print(f"\nRun the daemon to discover high-CPU processes automatically.")
             return
 
-        print("Discovered processes (awaiting review):\n")
-        print(f"{'ID':<4} {'Owner':<10} {'Name':<25} {'Runs':<5} {'Runtime':<10} {'Last Seen':<20}")
-        print("-" * 80)
+        print(Colors.header("👀 Discovered Processes") + " (awaiting review)")
+        print()
+        print(f"{Colors.bold('ID'):<12} {Colors.bold('Owner'):<10} {Colors.bold('Name'):<25} {Colors.bold('Runs'):<8} {Colors.bold('Runtime'):<10} {Colors.bold('Last Seen'):<20}")
+        print(Colors.dim("─" * 85))
+
         for p in discovered:
             owner = p.get('owner') or '*'
             runs = p.get('unique_pid_count', 0)
             runtime = format_runtime(p.get('total_runtime_seconds', 0))
-            last_seen = p.get('last_seen', '')[:19] if p.get('last_seen') else '-'
-            print(f"{p['id']:<4} {owner:<10} {p['name']:<25} {runs:<5} {runtime:<10} {last_seen:<20}")
+            last_seen = p.get('last_seen', '')[:16].replace('T', ' ') if p.get('last_seen') else '-'
+            print(f"{Colors.warn(p['id']):<12} {owner:<10} {Colors.bold(p['name']):<25} {runs:<8} {runtime:<10} {Colors.dim(last_seen):<20}")
 
-        print("\nUse 'playtimed discover promote <id> <category>' to monitor")
-        print("Use 'playtimed discover ignore <id>' to ignore")
-        print("Use 'playtimed discover disallow <id>' to block")
+        print()
+        print(Colors.dim("Actions:"))
+        print(f"  {Colors.ok('promote')} <id> gaming   - Monitor as a game")
+        print(f"  {Colors.dim('ignore')} <id>         - Ignore (not a game)")
+        print(f"  {Colors.error('disallow')} <id>      - Block (terminate on sight)")
 
     elif args.action == "promote":
         db.set_pattern_state(args.id, 'active', category=args.category)
