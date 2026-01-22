@@ -19,11 +19,11 @@ Design: `docs/message-router-design.md`
 - [x] Add `message_log` cleanup to maintenance
 
 ## Phase 2: Message Router
-- [ ] Create `router.py` module
-- [ ] Implement template selection (random variant)
-- [ ] Implement variable rendering
-- [ ] Connect router to `NotificationDispatcher`
-- [ ] Add delivery logging
+- [x] Create `router.py` module
+- [x] Implement template selection (random variant)
+- [x] Implement variable rendering
+- [x] Connect router to `NotificationDispatcher`
+- [x] Add delivery logging
 
 ## Phase 3: State Machine Integration
 - [ ] Add state tracking to `_process_user()`
