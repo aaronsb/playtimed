@@ -1,0 +1,40 @@
+# Changelog
+
+All notable changes to playtimed will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.2.0] - 2026-01-21
+
+### Added
+- **Message Router**: Centralized notification handling with template selection and variable rendering
+- **Message Templates**: 24 default templates with multiple variants per intention for variety
+- **NotificationBackend Protocol**: Abstraction layer with priority fallback (Clippy → Freedesktop → Log-only)
+- **Database State Machine**: Warning flags (warned_30/15/5) prevent duplicate notifications
+- **Timestamp-Based Time Tracking**: Accurate time calculation with suspend/resume handling
+- **CLI Commands**: `playtimed message list|test|add` for template management
+- **32 New Tests**: Router tests (13) and state machine tests (19), now 65 total
+
+### Changed
+- Daemon now uses `MessageRouter` for all notifications instead of inline templates
+- State tracking moved from JSON files to SQLite database
+- Time tracking uses wall-clock timestamps instead of poll intervals
+- Large time gaps (>2x poll interval) are capped to handle laptop suspend
+
+### Fixed
+- Warning notifications no longer repeat every poll cycle (flag-based deduplication)
+- Time tracking accuracy improved for variable poll timing
+
+## [0.1.0] - 2026-01-20
+
+### Added
+- Initial MVP release
+- Process monitoring daemon with CPU-based activity detection
+- SQLite database for metrics, patterns, and user configuration
+- KDE/Freedesktop notification support
+- CLI for status, user management, pattern management
+- Automatic database retention (30 days events, 90 days sessions)
+- Daemon modes: normal, passthrough, strict
+- Process discovery for unknown high-CPU applications
+- Install/uninstall scripts with isolated venv
