@@ -334,6 +334,10 @@ class ClaudeDaemon:
         # Set up signal handlers
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
+        signal.signal(signal.SIGHUP, self._handle_reload)  # Reload config on SIGHUP
+
+        # Monitored users (reloaded periodically)
+        self.users: list[str] = []
 
     def _is_excluded_process(self, proc_name: str, cmdline: str, pid: int) -> bool:
         """Check if a process should never be monitored/killed."""
@@ -370,16 +374,38 @@ class ClaudeDaemon:
 
         return False
 
+    def _handle_reload(self, signum, frame):
+        """Handle SIGHUP - reload all config."""
+        log.info("Received SIGHUP, reloading configuration...")
+        self._reload_config()
+
     def _reload_config(self):
-        """Reload daemon config from database (for mode changes)."""
+        """Reload daemon config from database (mode, users, discovery settings)."""
+        # Reload daemon mode
         old_mode = self.mode
         self.daemon_config = self.db.get_daemon_config()
         self.mode = self.daemon_config['mode']
 
+        # Reload discovery config
+        self.discovery_config = self.db.get_discovery_config()
+
+        # Reload user list
+        old_users = set(self.users)
+        self.users = self.db.get_all_monitored_users()
+        new_users = set(self.users)
+
+        # Log user changes
+        added = new_users - old_users
+        removed = old_users - new_users
+        if added:
+            log.info(f"Added users: {', '.join(added)}")
+        if removed:
+            log.info(f"Removed users: {', '.join(removed)}")
+
         if old_mode != self.mode:
             log.info(f"Mode changed: {old_mode} -> {self.mode}")
             # Notify all users about mode change
-            for user in self.db.get_all_monitored_users():
+            for user in self.users:
                 notifier = self._get_notifier(user)
                 if self.mode == 'passthrough':
                     notifier.send("🔓 Passthrough Mode",
@@ -925,24 +951,24 @@ class ClaudeDaemon:
 
         poll_interval = self.config["daemon"].get("poll_interval", 30)
 
-        # Get users from database, fall back to config
-        users = self.db.get_all_monitored_users()
-        if not users:
-            users = list(self.config.get("users", {}).keys())
+        # Initial user load
+        self.users = self.db.get_all_monitored_users()
+        if not self.users:
+            self.users = list(self.config.get("users", {}).keys())
 
-        if not users:
+        if not self.users:
             log.warning("No users configured, nothing to monitor")
         else:
-            log.info(f"Monitoring users: {', '.join(users)}")
+            log.info(f"Monitoring users: {', '.join(self.users)}")
 
         loop_count = 0
         while self.running:
-            # Reload config every 10 loops (for mode changes via CLI)
+            # Reload config every 10 loops (mode, users, discovery settings)
             loop_count += 1
             if loop_count % 10 == 0:
                 self._reload_config()
 
-            for user in users:
+            for user in self.users:
                 try:
                     self._process_user(user)
                 except Exception as e:
@@ -951,7 +977,7 @@ class ClaudeDaemon:
             time.sleep(poll_interval)
 
         # Save all state on exit
-        for user in users:
+        for user in self.users:
             self._save_user_state(user)
 
         log.info("playtimed shutdown complete")

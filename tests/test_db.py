@@ -114,7 +114,7 @@ class TestDiscovery:
         config = db.get_discovery_config()
         assert config['enabled'] is True
         assert config['cpu_threshold'] == 25.0
-        assert config['sample_window_seconds'] == 30
+        assert config['sample_window_seconds'] == 120
         assert config['min_samples'] == 3
 
         db.set_discovery_config('cpu_threshold', '35')

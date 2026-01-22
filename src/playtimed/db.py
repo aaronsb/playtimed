@@ -141,7 +141,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             INSERT OR IGNORE INTO discovery_config (key, value, description) VALUES
                 ('enabled', '1', 'Enable automatic process discovery'),
                 ('cpu_threshold', '25', 'Minimum CPU% to consider for discovery'),
-                ('sample_window_seconds', '30', 'How long to observe before flagging'),
+                ('sample_window_seconds', '120', 'How long to observe before flagging'),
                 ('min_samples', '3', 'Minimum samples above threshold to flag');
         """)
 
@@ -201,7 +201,7 @@ def migrate_db(db_path: str = DEFAULT_DB_PATH) -> None:
             INSERT OR IGNORE INTO discovery_config (key, value, description) VALUES
                 ('enabled', '1', 'Enable automatic process discovery'),
                 ('cpu_threshold', '25', 'Minimum CPU% to consider for discovery'),
-                ('sample_window_seconds', '30', 'How long to observe before flagging'),
+                ('sample_window_seconds', '120', 'How long to observe before flagging'),
                 ('min_samples', '3', 'Minimum samples above threshold to flag');
         """)
 
