@@ -5,6 +5,14 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-01-22
+
+### Fixed
+- **User-Targeted Notifications**: Daemon now sends desktop notifications to the correct user's session bus
+  - Connects to `/run/user/<uid>/bus` instead of daemon's non-existent session
+  - Notifications now appear on Anders' desktop instead of falling back to logs
+  - Per-user backend caching with automatic reconnect on logout/login
+
 ## [0.2.0] - 2026-01-21
 
 ### Added
