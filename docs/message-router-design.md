@@ -389,11 +389,80 @@ Time used:
   Total: 2 hours ✓
 ```
 
-This is tracked via:
-- `gaming_active` boolean flag in user state
-- When ANY tracked gaming process is running → clock ticks
-- When NO tracked gaming processes → clock stops
-- Multiple simultaneous games = still just one clock
+### Timestamp-Based Tracking (Not Interval-Based)
+
+**Problem with interval-based:**
+```python
+# BAD: assumes poll_interval is accurate
+if gaming_active:
+    gaming_time += poll_interval  # What if poll was delayed?
+```
+
+**Better: use actual timestamps:**
+```python
+# GOOD: compute from real clock
+if gaming_active:
+    now = time.time()
+    elapsed = now - last_check_time
+    gaming_time += elapsed
+    last_check_time = now
+```
+
+**Schema:**
+```sql
+-- In daily_summary
+gaming_active INTEGER DEFAULT 0,
+gaming_started_at TEXT,  -- ISO timestamp when current session began
+last_poll_at TEXT,       -- timestamp of last poll (for elapsed calc)
+```
+
+**Logic:**
+```python
+now = datetime.now()
+
+if gaming_active and was_gaming_active:
+    # Continuing session - add elapsed time since last poll
+    elapsed = (now - last_poll_at).total_seconds()
+    gaming_time += elapsed
+
+elif gaming_active and not was_gaming_active:
+    # Just started gaming
+    gaming_started_at = now
+    # Don't add time yet - will add on next poll
+
+elif not gaming_active and was_gaming_active:
+    # Just stopped gaming - add final elapsed
+    elapsed = (now - last_poll_at).total_seconds()
+    gaming_time += elapsed
+    gaming_started_at = None
+
+last_poll_at = now
+```
+
+This handles:
+- Poll delays (CPU load, system sleep)
+- Laptop suspend/resume
+- Variable poll timing
+
+### Suspend/Resume Handling
+
+What if the laptop suspends for 2 hours while a game is "running"?
+
+**Problem:** Game process still exists after resume, but user wasn't actually playing.
+
+**Solution:** Cap elapsed time at reasonable maximum (e.g., 2x poll_interval)
+
+```python
+elapsed = (now - last_poll_at).total_seconds()
+max_elapsed = poll_interval * 2  # 60 seconds if poll is 30s
+
+if elapsed > max_elapsed:
+    # Likely suspend/resume - don't charge full time
+    log.info(f"Large gap detected ({elapsed}s), capping at {max_elapsed}s")
+    elapsed = max_elapsed
+```
+
+This is generous to the user (doesn't charge for suspend time) while still being accurate during normal operation.
 
 ### Process-Independent Time
 
@@ -501,6 +570,65 @@ When does the "day" reset?
 - **Configurable:** Let parent decide
 
 **Recommendation:** Default to 4 AM, configurable via `reset_hour`.
+
+### Poll Interval and CPU Efficiency
+
+**Target:** Minimal CPU footprint. This daemon should be invisible.
+
+**Poll interval:** 30 seconds (configurable)
+
+This is a reasonable tradeoff:
+- Accurate enough for time tracking (±30s on a 2-hour limit = 0.4% error)
+- Fast enough to catch process launches before user notices delay
+- Slow enough to be negligible CPU impact
+
+**CPU optimization strategies:**
+
+1. **Sleep between polls** - Use `time.sleep()`, not busy-wait
+   ```python
+   while running:
+       poll()
+       time.sleep(poll_interval)
+   ```
+
+2. **Filter processes early** - Don't iterate all processes if no users are monitored
+   ```python
+   if not monitored_users:
+       continue
+   ```
+
+3. **Cache compiled regexes** - Pattern matching is the expensive part
+   ```python
+   # On startup / config reload
+   self.compiled_patterns = {
+       p['id']: re.compile(p['pattern'], re.IGNORECASE)
+       for p in db.get_patterns()
+   }
+   ```
+
+4. **Only check relevant users' processes** - Filter by UID
+   ```python
+   for proc in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent']):
+       if proc.info['username'] not in monitored_users:
+           continue  # Skip early
+   ```
+
+5. **Batch database writes** - Don't write on every poll if nothing changed
+   ```python
+   if state_changed or elapsed > 60:  # Write at least every minute
+       db.update_state(...)
+   ```
+
+6. **Lazy CPU sampling** - `cpu_percent()` needs two samples
+   ```python
+   # First call returns 0, need interval
+   proc.cpu_percent(interval=None)  # Use cached value from last call
+   ```
+
+**Expected overhead:**
+- ~50ms per poll cycle on typical system
+- <0.1% CPU when idle
+- <1% CPU during active monitoring
 
 ### Daemon restart recovery
 
