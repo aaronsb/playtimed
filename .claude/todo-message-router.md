@@ -33,11 +33,11 @@ Design: `docs/message-router-design.md`
 - [x] Handle suspend/resume (cap elapsed time)
 
 ## Phase 4: CLI & Testing
-- [ ] `playtimed message test <intention>` command
-- [ ] `playtimed message list` command
-- [ ] `playtimed message add` command
-- [ ] Tests for router logic
-- [ ] Tests for state machine transitions
+- [x] `playtimed message test <intention>` command
+- [x] `playtimed message list` command
+- [x] `playtimed message add` command
+- [x] Tests for router logic
+- [ ] Tests for state machine transitions (future)
 
 ## Notes
 - Single user per session (multiple users possible, not simultaneous)

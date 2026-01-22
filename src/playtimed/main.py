@@ -1349,6 +1349,79 @@ def cmd_discover(args):
             print(f"  min_samples:          {config['min_samples']}")
 
 
+def cmd_message(args):
+    """Manage and test message templates."""
+    if args.action == "add":
+        require_root("message add")
+
+    try:
+        db = ActivityDB(args.db)
+    except Exception:
+        print(f"Error: Cannot access database at {args.db}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.action == "list":
+        templates = db.get_all_templates()
+        if not templates:
+            print("No templates found.")
+            return
+
+        # Group by intention
+        by_intention = {}
+        for t in templates:
+            intention = t['intention']
+            if intention not in by_intention:
+                by_intention[intention] = []
+            by_intention[intention].append(t)
+
+        print(Colors.header("Message Templates"))
+        print()
+
+        for intention in sorted(by_intention.keys()):
+            variants = by_intention[intention]
+            enabled_count = sum(1 for v in variants if v['enabled'])
+            print(f"{Colors.bold(intention)} ({enabled_count}/{len(variants)} enabled)")
+            for v in variants:
+                status = Colors.ok("●") if v['enabled'] else Colors.dim("○")
+                urgency = v['urgency']
+                urgency_color = Colors.RED if urgency == 'critical' else Colors.YELLOW if urgency == 'normal' else Colors.DIM
+                print(f"  {status} [{v['id']}] {v['title']}")
+                print(f"      {Colors.dim(v['body'][:60])}{'...' if len(v['body']) > 60 else ''}")
+            print()
+
+    elif args.action == "test":
+        # Send a test notification for the given intention
+        router = MessageRouter(db)
+        ctx = MessageContext(
+            user=args.user or "test_user",
+            process=args.process or "TestGame",
+            time_left=args.time_left or 30,
+            time_used=60,
+            time_limit=120,
+            grace_seconds=30,
+            mode="normal",
+        )
+        notification_id, backend = router.send(args.intention, ctx)
+        print(f"Sent '{args.intention}' notification via {backend} (id: {notification_id})")
+
+        # Show what was sent
+        recent = db.get_recent_messages(limit=1)
+        if recent:
+            msg = recent[0]
+            print(f"\n{Colors.bold('Title:')} {msg['rendered_title']}")
+            print(f"{Colors.bold('Body:')} {msg['rendered_body']}")
+
+    elif args.action == "add":
+        template_id = db.add_template(
+            intention=args.intention,
+            title=args.title,
+            body=args.body,
+            icon=args.icon or 'dialog-information',
+            urgency=args.urgency or 'normal',
+        )
+        print(f"Added template {template_id} for intention '{args.intention}'")
+
+
 def cmd_user(args):
     """Manage user limits."""
     if args.action in ("add", "disable", "enable"):
@@ -1510,6 +1583,25 @@ Examples:
     config_disc.add_argument("key", nargs="?", help="Config key to set")
     config_disc.add_argument("value", nargs="?", help="Value to set")
 
+    # Message management
+    message_parser = subparsers.add_parser("message", help="Manage message templates")
+    message_sub = message_parser.add_subparsers(dest="action")
+
+    message_sub.add_parser("list", help="List all message templates")
+
+    test_msg = message_sub.add_parser("test", help="Send a test notification")
+    test_msg.add_argument("intention", help="Message intention to test (e.g., process_start, time_warning_30)")
+    test_msg.add_argument("--user", help="Test user name (default: test_user)")
+    test_msg.add_argument("--process", help="Test process name (default: TestGame)")
+    test_msg.add_argument("--time-left", type=int, help="Test time left in minutes (default: 30)")
+
+    add_msg = message_sub.add_parser("add", help="Add a custom template")
+    add_msg.add_argument("intention", help="Message intention")
+    add_msg.add_argument("title", help="Notification title (supports {var} placeholders)")
+    add_msg.add_argument("body", help="Notification body (supports {var} placeholders)")
+    add_msg.add_argument("--icon", help="Icon name (default: dialog-information)")
+    add_msg.add_argument("--urgency", choices=["low", "normal", "critical"], help="Urgency level (default: normal)")
+
     # User management
     user_parser = subparsers.add_parser("user", help="Manage user limits")
     user_sub = user_parser.add_subparsers(dest="action")
@@ -1558,6 +1650,11 @@ Examples:
             cmd_user(args)
         else:
             user_parser.print_help()
+    elif args.command == "message":
+        if args.action:
+            cmd_message(args)
+        else:
+            message_parser.print_help()
     else:
         parser.print_help()
 
