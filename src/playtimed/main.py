@@ -291,6 +291,19 @@ def format_duration(seconds: int) -> str:
 class ClaudeDaemon:
     """Main daemon class."""
 
+    # Critical system processes to never kill (not games, would break the system)
+    SYSTEM_PROCESSES = {
+        'systemd', 'dbus-daemon', 'pipewire', 'pulseaudio', 'wireplumber',
+        'kwin', 'kwin_wayland', 'kwin_x11', 'plasmashell', 'kded5', 'kded6',
+        'Xorg', 'Xwayland', 'gnome-shell', 'mutter',
+        'sddm', 'gdm', 'gdm-session', 'lightdm', 'login', 'agetty',
+        'sudo', 'su', 'ssh', 'sshd', 'notify-send', 'dbus-launch',
+        'polkitd', 'upowerd', 'thermald', 'acpid',
+    }
+
+    # Shell processes - not games
+    SHELL_PROCESSES = {'bash', 'zsh', 'fish', 'sh', 'dash', 'csh', 'tcsh'}
+
     def __init__(self, config_path: str):
         self.config = self._load_config(config_path)
         self.running = True
@@ -301,17 +314,85 @@ class ClaudeDaemon:
         # Discovery tracking: {(user, proc_name): {'samples': [...], 'first_seen': time}}
         self.discovery_candidates: dict[tuple[str, str], dict] = {}
 
+        # Strict mode pending kills: {pid: {'name': str, 'warned_at': time, 'user': str}}
+        self.strict_pending: dict[int, dict] = {}
+
+        # Our own PID (never kill ourselves!)
+        self.our_pid = os.getpid()
+
         # Initialize database
         db_path = self.config.get("daemon", {}).get("db_path", DEFAULT_DB_PATH)
         self.db = ActivityDB(db_path)
         log.info(f"Database initialized at {db_path}")
 
-        # Load discovery config
+        # Load configs
         self.discovery_config = self.db.get_discovery_config()
+        self.daemon_config = self.db.get_daemon_config()
+        self.mode = self.daemon_config['mode']
+        log.info(f"Daemon mode: {self.mode}")
 
         # Set up signal handlers
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
+
+    def _is_excluded_process(self, proc_name: str, cmdline: str, pid: int) -> bool:
+        """Check if a process should never be monitored/killed."""
+        # Never kill ourselves (by PID - unforgeable)
+        if pid == self.our_pid:
+            return True
+
+        # Never kill our parent (the Python interpreter running us)
+        try:
+            if psutil.Process(pid).ppid() == self.our_pid:
+                return True
+        except psutil.NoSuchProcess:
+            pass
+
+        # System processes - these would break the system
+        if proc_name in self.SYSTEM_PROCESSES:
+            return True
+
+        # Shell processes - not games
+        if proc_name in self.SHELL_PROCESSES:
+            return True
+
+        # Check if it's ACTUALLY playtimed (not just named playtimed)
+        # Must be Python running playtimed.main, not a renamed binary
+        if 'playtimed' in proc_name.lower():
+            # Verify it's really us: Python + playtimed.main in cmdline
+            if 'python' in cmdline.lower() and 'playtimed.main' in cmdline:
+                return True
+            # If something is just named "playtimed" but isn't Python running our module,
+            # it's suspicious - DO NOT exclude it (could be renamed game)
+            log.warning(f"Process {proc_name} (PID {pid}) claims to be playtimed "
+                        f"but doesn't look legitimate: {cmdline[:100]}")
+            return False
+
+        return False
+
+    def _reload_config(self):
+        """Reload daemon config from database (for mode changes)."""
+        old_mode = self.mode
+        self.daemon_config = self.db.get_daemon_config()
+        self.mode = self.daemon_config['mode']
+
+        if old_mode != self.mode:
+            log.info(f"Mode changed: {old_mode} -> {self.mode}")
+            # Notify all users about mode change
+            for user in self.db.get_all_monitored_users():
+                notifier = self._get_notifier(user)
+                if self.mode == 'passthrough':
+                    notifier.send("🔓 Passthrough Mode",
+                                  "I'm now in passthrough mode. I'll watch but won't enforce limits.",
+                                  urgency="low")
+                elif self.mode == 'strict':
+                    notifier.send("🔒 Strict Mode",
+                                  "I'm now in strict mode. Unknown applications will be terminated.",
+                                  urgency="critical")
+                elif self.mode == 'normal':
+                    notifier.send("✅ Normal Mode",
+                                  "I'm back to normal mode. Regular rules apply.",
+                                  urgency="normal")
 
     def _load_config(self, path: str) -> dict:
         """Load configuration from YAML file."""
@@ -434,9 +515,13 @@ class ClaudeDaemon:
     def _scan_all_processes(self, user: str):
         """Scan all processes for a user, handling all pattern states and discovery."""
         poll_interval = self.config["daemon"].get("poll_interval", 30)
+        grace_seconds = self.daemon_config.get('strict_grace_seconds', 30)
 
         # Get ALL patterns (all states) for matching
         all_patterns = self.db.get_patterns(enabled_only=True, include_all_states=True, owner=user)
+
+        # Track which PIDs are still running (for strict mode cleanup)
+        seen_pids = set()
 
         for proc in psutil.process_iter(['pid', 'name', 'username', 'cmdline']):
             try:
@@ -447,10 +532,11 @@ class ClaudeDaemon:
                 proc_name = proc.info.get('name', '')
                 pid = proc.info['pid']
 
-                # Skip system/shell processes
-                if proc_name in ('bash', 'zsh', 'fish', 'sh', 'python', 'python3',
-                                 'systemd', 'dbus-daemon', 'pipewire', 'pulseaudio'):
+                # Skip excluded processes (ourselves, system processes)
+                if self._is_excluded_process(proc_name, cmdline, pid):
                     continue
+
+                seen_pids.add(pid)
 
                 try:
                     cpu = proc.cpu_percent(interval=0.1)
@@ -469,24 +555,76 @@ class ClaudeDaemon:
                     if cpu >= matched_pattern.get('cpu_threshold', 5.0):
                         self.db.add_runtime(pattern_id, poll_interval)
 
-                    # Handle disallowed processes
-                    if state == 'disallowed':
+                    # Handle disallowed processes (unless passthrough mode)
+                    if state == 'disallowed' and self.mode != 'passthrough':
                         log.info(f"Killing disallowed process: {proc_name} (PID {pid})")
                         self._kill_process(ProcessMatch(
                             pid=pid, name=proc_name, category="disallowed",
                             cmdline=cmdline[:100], cpu_percent=cpu
-                        ), user)
+                        ), user, notify=True, reason="BLOCKED")
                         notifier = self._get_notifier(user)
                         notifier.send("🚫 Blocked",
                                       f"I stopped {proc_name} - it's on the not-allowed list.",
                                       urgency="critical")
 
+                    # Remove from strict pending if it's a known pattern (active/ignored)
+                    if pid in self.strict_pending and state in ('active', 'ignored'):
+                        del self.strict_pending[pid]
+
                 else:
-                    # No pattern match - check if this should be discovered
-                    self._check_discovery(user, proc_name, cmdline, pid, cpu)
+                    # No pattern match
+                    if self.mode == 'strict' and cpu >= self.discovery_config.get('cpu_threshold', 25):
+                        # Strict mode: unknown high-CPU process - warn then kill
+                        self._handle_strict_unknown(user, proc_name, cmdline, pid, cpu, grace_seconds)
+                    else:
+                        # Normal/passthrough: check if this should be discovered
+                        self._check_discovery(user, proc_name, cmdline, pid, cpu)
 
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+
+        # Clean up strict_pending for processes that are no longer running
+        dead_pids = [pid for pid in self.strict_pending if pid not in seen_pids]
+        for pid in dead_pids:
+            del self.strict_pending[pid]
+
+    def _handle_strict_unknown(self, user: str, proc_name: str, cmdline: str,
+                                pid: int, cpu: float, grace_seconds: int):
+        """Handle unknown processes in strict mode - warn then kill after grace period."""
+        now = time.time()
+        notifier = self._get_notifier(user)
+
+        if pid not in self.strict_pending:
+            # First time seeing this - warn and start countdown
+            self.strict_pending[pid] = {
+                'name': proc_name,
+                'warned_at': now,
+                'user': user,
+                'cmdline': cmdline,
+            }
+            log.warning(f"[STRICT] Unknown process {proc_name} (PID {pid}) - warning sent, "
+                        f"will terminate in {grace_seconds}s")
+            notifier.send("⚠️ Unknown Application",
+                          f"I don't recognize {proc_name}. "
+                          f"It will be closed in {grace_seconds} seconds unless it's approved.",
+                          urgency="critical")
+            # Also discover it so admin can review
+            self._check_discovery(user, proc_name, cmdline, pid, cpu)
+        else:
+            # Already warned - check if grace period expired
+            warned_at = self.strict_pending[pid]['warned_at']
+            elapsed = now - warned_at
+
+            if elapsed >= grace_seconds:
+                log.info(f"[STRICT] Grace period expired for {proc_name} (PID {pid}) - terminating")
+                self._kill_process(ProcessMatch(
+                    pid=pid, name=proc_name, category="unknown",
+                    cmdline=cmdline[:100], cpu_percent=cpu
+                ), user, notify=True, reason="BLOCKED")
+                notifier.send("🚫 Unknown App Closed",
+                              f"I closed {proc_name} because it wasn't on the approved list.",
+                              urgency="critical")
+                del self.strict_pending[pid]
 
     def _check_discovery(self, user: str, proc_name: str, cmdline: str, pid: int, cpu: float):
         """Check if an unmatched process should be flagged for discovery."""
@@ -616,28 +754,66 @@ class ClaudeDaemon:
                 log.info(f"Sent {threshold}min warning to {user}")
                 break
 
-    def _kill_process(self, proc: ProcessMatch, user: str):
-        """Terminate a process gracefully, then forcefully."""
+    def _kill_process(self, proc: ProcessMatch, user: str, notify: bool = True,
+                       reason: str = "KILLED"):
+        """Terminate a process and its children gracefully, then forcefully.
+
+        In passthrough mode, this is a no-op (just logs).
+        """
+        # Passthrough mode - don't actually kill anything
+        if self.mode == 'passthrough':
+            log.info(f"[PASSTHROUGH] Would kill {proc.name} (PID {proc.pid}) but mode is passthrough")
+            return
+
         notifier = self._get_notifier(user)
 
         try:
             p = psutil.Process(proc.pid)
 
-            # SIGTERM first
+            # Get children BEFORE killing parent (they might get orphaned)
+            children = []
+            try:
+                children = p.children(recursive=True)
+            except psutil.NoSuchProcess:
+                pass
+
+            # SIGTERM to main process first
             log.info(f"Sending SIGTERM to {proc.name} (PID {proc.pid})")
             p.terminate()
 
+            # Also terminate children
+            for child in children:
+                try:
+                    if not self._is_excluded_process(child.name(), ' '.join(child.cmdline() or []), child.pid):
+                        log.info(f"Sending SIGTERM to child {child.name()} (PID {child.pid})")
+                        child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+
             # Wait for graceful exit
             try:
-                p.wait(timeout=30)
+                p.wait(timeout=10)
                 log.info(f"{proc.name} exited gracefully")
             except psutil.TimeoutExpired:
-                # SIGKILL
+                # SIGKILL the main process
                 log.info(f"Sending SIGKILL to {proc.name} (PID {proc.pid})")
-                p.kill()
+                try:
+                    p.kill()
+                except psutil.NoSuchProcess:
+                    pass
 
-            notifier.send("🎮 Time's Up",
-                         MessageTemplates.get("KILLED", app=proc.name))
+            # SIGKILL any remaining children
+            for child in children:
+                try:
+                    if child.is_running():
+                        log.info(f"Sending SIGKILL to child {child.name()} (PID {child.pid})")
+                        child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+
+            if notify:
+                notifier.send("🎮 Time's Up",
+                             MessageTemplates.get(reason, app=proc.name))
 
         except psutil.NoSuchProcess:
             log.debug(f"Process {proc.pid} already gone")
@@ -759,7 +935,13 @@ class ClaudeDaemon:
         else:
             log.info(f"Monitoring users: {', '.join(users)}")
 
+        loop_count = 0
         while self.running:
+            # Reload config every 10 loops (for mode changes via CLI)
+            loop_count += 1
+            if loop_count % 10 == 0:
+                self._reload_config()
+
             for user in users:
                 try:
                     self._process_user(user)
@@ -866,6 +1048,48 @@ def cmd_status(args):
     for u in users:
         row = _get_user_status_row(db, u)
         print(f"  {row['user']}: Gaming {Colors.ok(row['gaming_remaining'])}, Total {Colors.ok(row['total_remaining'])}")
+
+
+def cmd_mode(args):
+    """View or set daemon mode."""
+    try:
+        db = ActivityDB(args.db)
+    except Exception:
+        print(f"Error: Cannot access database at {args.db}", file=sys.stderr)
+        print("Try: sudo playtimed mode", file=sys.stderr)
+        sys.exit(1)
+
+    if args.set_mode:
+        require_root(f"mode {args.set_mode}")
+        try:
+            db.set_daemon_mode(args.set_mode)
+            print(f"Mode set to: {Colors.bold(args.set_mode)}")
+            print(Colors.dim("Daemon will pick up change within ~5 minutes, or restart it."))
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        config = db.get_daemon_config()
+        mode = config['mode']
+        grace = config['strict_grace_seconds']
+
+        mode_descriptions = {
+            'normal': 'Monitor and enforce limits for known gaming patterns',
+            'passthrough': 'Monitor only - no enforcement, no blocking',
+            'strict': f'Whitelist only - unknown apps terminated after {grace}s warning',
+        }
+
+        print(Colors.header("Daemon Mode"))
+        print()
+
+        for m, desc in mode_descriptions.items():
+            if m == mode:
+                print(f"  {Colors.ok('●')} {Colors.bold(m):<14} {desc}")
+            else:
+                print(f"  {Colors.dim('○')} {m:<14} {Colors.dim(desc)}")
+
+        print()
+        print(f"Set mode: {Colors.info('sudo playtimed mode <normal|passthrough|strict>')}")
 
 
 def cmd_maintenance(args):
@@ -1145,6 +1369,11 @@ Examples:
     maint_parser.add_argument("--sessions-days", type=int, default=90,
                               help="Keep sessions for this many days")
 
+    # Mode command
+    mode_parser = subparsers.add_parser("mode", help="View or set daemon mode")
+    mode_parser.add_argument("set_mode", nargs="?", choices=["normal", "passthrough", "strict"],
+                             help="Mode to set (normal, passthrough, strict)")
+
     # Pattern management
     pattern_parser = subparsers.add_parser("patterns", help="Manage process patterns")
     pattern_sub = pattern_parser.add_subparsers(dest="action")
@@ -1219,6 +1448,8 @@ Examples:
         cmd_status(args)
     elif args.command == "maintenance":
         cmd_maintenance(args)
+    elif args.command == "mode":
+        cmd_mode(args)
     elif args.command == "patterns":
         if args.action:
             cmd_patterns(args)

@@ -210,6 +210,33 @@ class TestMigration:
         assert patterns is not None
 
 
+class TestDaemonConfig:
+    """Tests for daemon configuration."""
+
+    def test_get_daemon_config(self, db):
+        """Test getting daemon config with defaults."""
+        config = db.get_daemon_config()
+        assert config['mode'] == 'normal'
+        assert config['strict_grace_seconds'] == 30
+
+    def test_set_daemon_mode(self, db):
+        """Test setting daemon mode."""
+        db.set_daemon_mode('passthrough')
+        assert db.get_daemon_mode() == 'passthrough'
+
+        db.set_daemon_mode('strict')
+        assert db.get_daemon_mode() == 'strict'
+
+        db.set_daemon_mode('normal')
+        assert db.get_daemon_mode() == 'normal'
+
+    def test_invalid_daemon_mode(self, db):
+        """Test that invalid modes are rejected."""
+        import pytest
+        with pytest.raises(ValueError):
+            db.set_daemon_mode('invalid_mode')
+
+
 class TestDailySummary:
     """Tests for daily summary tracking."""
 

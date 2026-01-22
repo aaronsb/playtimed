@@ -127,6 +127,13 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 ON process_patterns(monitor_state);
             CREATE INDEX IF NOT EXISTS idx_patterns_owner
                 ON process_patterns(owner);
+
+            -- Daemon configuration (mode, etc.)
+            CREATE TABLE IF NOT EXISTS daemon_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                description TEXT
+            );
         """)
 
         # Seed default discovery config
@@ -136,6 +143,13 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 ('cpu_threshold', '25', 'Minimum CPU% to consider for discovery'),
                 ('sample_window_seconds', '30', 'How long to observe before flagging'),
                 ('min_samples', '3', 'Minimum samples above threshold to flag');
+        """)
+
+        # Seed default daemon config
+        conn.executescript("""
+            INSERT OR IGNORE INTO daemon_config (key, value, description) VALUES
+                ('mode', 'normal', 'Daemon mode: normal, passthrough, strict'),
+                ('strict_grace_seconds', '30', 'Grace period before terminating in strict mode');
         """)
 
 
@@ -194,6 +208,22 @@ def migrate_db(db_path: str = DEFAULT_DB_PATH) -> None:
         # Add new indexes if they don't exist
         conn.execute("CREATE INDEX IF NOT EXISTS idx_patterns_state ON process_patterns(monitor_state)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_patterns_owner ON process_patterns(owner)")
+
+        # Create daemon_config table if not exists
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS daemon_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                description TEXT
+            )
+        """)
+
+        # Seed default daemon config
+        conn.executescript("""
+            INSERT OR IGNORE INTO daemon_config (key, value, description) VALUES
+                ('mode', 'normal', 'Daemon mode: normal, passthrough, strict'),
+                ('strict_grace_seconds', '30', 'Grace period before terminating in strict mode');
+        """)
 
 
 @contextmanager
@@ -472,6 +502,36 @@ class ActivityDB:
             conn.execute("""
                 UPDATE discovery_config SET value = ? WHERE key = ?
             """, (str(value), key))
+
+    # --- Daemon Configuration ---
+
+    def get_daemon_config(self) -> dict:
+        """Get daemon configuration as a dict."""
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute("SELECT key, value FROM daemon_config").fetchall()
+            config = {row['key']: row['value'] for row in rows}
+            return {
+                'mode': config.get('mode', 'normal'),
+                'strict_grace_seconds': int(config.get('strict_grace_seconds', '30')),
+            }
+
+    def set_daemon_config(self, key: str, value: str):
+        """Update a daemon config value."""
+        with get_connection(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO daemon_config (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = ?
+            """, (key, str(value), str(value)))
+
+    def get_daemon_mode(self) -> str:
+        """Get current daemon mode (normal, passthrough, strict)."""
+        return self.get_daemon_config()['mode']
+
+    def set_daemon_mode(self, mode: str):
+        """Set daemon mode. Valid values: normal, passthrough, strict."""
+        if mode not in ('normal', 'passthrough', 'strict'):
+            raise ValueError(f"Invalid mode: {mode}. Must be normal, passthrough, or strict.")
+        self.set_daemon_config('mode', mode)
 
     def discover_pattern(self, pattern: str, name: str, owner: str,
                          cmdline: str = None, cpu_threshold: float = 5.0) -> int:
