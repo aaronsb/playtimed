@@ -96,11 +96,42 @@ systemctl daemon-reload
 
 info "Installation complete!"
 echo ""
-echo "Next steps:"
-echo "  1. Configure users: playtimed user add <username> --gaming-limit 120"
-echo "  2. Review config:   $CONFIG_DIR/config.yaml"
-echo "  3. Start daemon:    systemctl start playtimed"
-echo "  4. Enable on boot:  systemctl enable playtimed"
-echo "  5. Check status:    playtimed status <username>"
+
+# Ask about enabling and starting the service
+ask_yes_no() {
+    local prompt="$1"
+    local default="${2:-n}"
+    local yn
+
+    if [[ "$default" == "y" ]]; then
+        prompt="$prompt [Y/n] "
+    else
+        prompt="$prompt [y/N] "
+    fi
+
+    read -r -p "$prompt" yn
+    yn="${yn:-$default}"
+
+    [[ "$yn" =~ ^[Yy] ]]
+}
+
+if ask_yes_no "Enable playtimed to start on boot?" "y"; then
+    systemctl enable playtimed
+    info "Service enabled"
+fi
+
+if ask_yes_no "Start playtimed now?" "y"; then
+    systemctl start playtimed
+    info "Service started"
+    sleep 1
+    systemctl status playtimed --no-pager || true
+fi
+
+echo ""
+echo "Quick start:"
+echo "  1. Configure users: sudo playtimed user add <username> --gaming-limit 120"
+echo "  2. Check status:    sudo playtimed status"
+echo "  3. View patterns:   sudo playtimed patterns list"
+echo "  4. Review discovered apps: sudo playtimed discover list"
 echo ""
 echo "Logs: journalctl -u playtimed -f"
