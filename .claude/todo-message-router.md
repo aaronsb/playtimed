@@ -37,7 +37,7 @@ Design: `docs/message-router-design.md`
 - [x] `playtimed message list` command
 - [x] `playtimed message add` command
 - [x] Tests for router logic
-- [ ] Tests for state machine transitions (future)
+- [x] Tests for state machine transitions
 
 ## Notes
 - Single user per session (multiple users possible, not simultaneous)
