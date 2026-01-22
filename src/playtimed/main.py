@@ -1161,6 +1161,8 @@ def cmd_patterns(args):
     """List or manage process patterns."""
     if args.action in ("add", "disable", "enable", "delete"):
         require_root(f"patterns {args.action}")
+    if args.action == "note" and hasattr(args, 'text') and args.text:
+        require_root("patterns note")
 
     try:
         db = ActivityDB(args.db)
@@ -1225,6 +1227,35 @@ def cmd_patterns(args):
     elif args.action == "delete":
         db.delete_pattern(args.id)
         print(f"Deleted pattern {args.id}")
+
+    elif args.action == "note":
+        pattern = db.get_pattern_by_id(args.id)
+        if not pattern:
+            print(f"Pattern {args.id} not found.", file=sys.stderr)
+            sys.exit(1)
+
+        if args.text:
+            # Set notes
+            db.set_pattern_notes(args.id, args.text)
+            print(f"Set notes on pattern {args.id} ({pattern['name']})")
+        else:
+            # View pattern details including notes
+            print(f"{Colors.bold('Pattern')} #{pattern['id']}: {pattern['name']}")
+            print(f"  {Colors.dim('Pattern:')}  {pattern['pattern']}")
+            print(f"  {Colors.dim('State:')}    {pattern['monitor_state']}")
+            print(f"  {Colors.dim('Category:')} {pattern.get('category') or '-'}")
+            print(f"  {Colors.dim('Owner:')}    {pattern.get('owner') or '*'}")
+            print(f"  {Colors.dim('CPU:')}      {pattern['cpu_threshold']}%")
+            print(f"  {Colors.dim('Runs:')}     {pattern.get('unique_pid_count', 0)}")
+            print(f"  {Colors.dim('Runtime:')}  {format_runtime(pattern.get('total_runtime_seconds', 0))}")
+            if pattern.get('discovered_cmdline'):
+                print(f"  {Colors.dim('Cmdline:')}  {pattern['discovered_cmdline']}")
+            print()
+            if pattern.get('notes'):
+                print(f"{Colors.bold('Notes:')}")
+                print(pattern['notes'])
+            else:
+                print(Colors.dim("No notes set."))
 
 
 def cmd_discover(args):
@@ -1370,6 +1401,10 @@ Examples:
 
   # Run the daemon (usually via systemd)
   playtimed run
+
+  # View pattern details / set notes on a pattern
+  playtimed patterns note 5
+  playtimed patterns note 5 "This is Minecraft Java edition"
 """
     parser = argparse.ArgumentParser(
         description="Claude-powered screen time daemon",
@@ -1421,6 +1456,10 @@ Examples:
 
     del_pat = pattern_sub.add_parser("delete", help="Delete a pattern")
     del_pat.add_argument("id", type=int, help="Pattern ID")
+
+    note_pat = pattern_sub.add_parser("note", help="View or set notes on a pattern")
+    note_pat.add_argument("id", type=int, help="Pattern ID")
+    note_pat.add_argument("text", nargs="?", help="Note text (omit to view)")
 
     # Discovery management
     discover_parser = subparsers.add_parser("discover", help="Manage process discovery")

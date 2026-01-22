@@ -134,6 +134,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 value TEXT NOT NULL,
                 description TEXT
             );
+
         """)
 
         # Seed default discovery config
@@ -224,6 +225,7 @@ def migrate_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 ('mode', 'normal', 'Daemon mode: normal, passthrough, strict'),
                 ('strict_grace_seconds', '30', 'Grace period before terminating in strict mode');
         """)
+
 
 
 @contextmanager
@@ -784,3 +786,23 @@ class ActivityDB:
 
         result['after'] = self.get_db_stats()
         return result
+
+    # --- Pattern Notes ---
+
+    def set_pattern_notes(self, pattern_id: int, notes: str):
+        """Set notes on a pattern."""
+        now = datetime.now().isoformat()
+        with get_connection(self.db_path) as conn:
+            conn.execute("""
+                UPDATE process_patterns
+                SET notes = ?, updated_at = ?
+                WHERE id = ?
+            """, (notes, now, pattern_id))
+
+    def get_pattern_by_id(self, pattern_id: int) -> Optional[dict]:
+        """Get a pattern by ID."""
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM process_patterns WHERE id = ?", (pattern_id,)
+            ).fetchone()
+            return dict(row) if row else None

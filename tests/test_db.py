@@ -257,3 +257,37 @@ class TestDailySummary:
 
         summary = db.get_daily_summary("anders")
         assert summary['session_count'] == 2
+
+
+class TestPatternNotes:
+    """Tests for pattern notes."""
+
+    def test_set_and_get_pattern_notes(self, db):
+        """Test setting and getting notes on a pattern."""
+        pattern_id = db.add_pattern("test", "Test", "gaming")
+        db.set_pattern_notes(pattern_id, "This is a test pattern")
+
+        pattern = db.get_pattern_by_id(pattern_id)
+        assert pattern['notes'] == "This is a test pattern"
+
+    def test_update_pattern_notes(self, db):
+        """Test updating notes on a pattern."""
+        pattern_id = db.add_pattern("test", "Test", "gaming", notes="Initial notes")
+        db.set_pattern_notes(pattern_id, "Updated notes")
+
+        pattern = db.get_pattern_by_id(pattern_id)
+        assert pattern['notes'] == "Updated notes"
+
+    def test_get_pattern_by_id(self, db):
+        """Test getting a pattern by ID."""
+        pattern_id = db.add_pattern("test", "Test Pattern", "gaming")
+        pattern = db.get_pattern_by_id(pattern_id)
+
+        assert pattern is not None
+        assert pattern['name'] == "Test Pattern"
+        assert pattern['id'] == pattern_id
+
+    def test_get_nonexistent_pattern(self, db):
+        """Test getting a pattern that doesn't exist."""
+        pattern = db.get_pattern_by_id(9999)
+        assert pattern is None

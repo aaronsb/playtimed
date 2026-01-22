@@ -16,6 +16,7 @@ authors = [
 dependencies = [
     "psutil>=5.9.0",
     "pyyaml>=6.0",
+    "dbus-python>=1.3.2",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +27,7 @@ dev = [
 
 [project.scripts]
 playtimed = "playtimed.main:main"
+playtimed-notify = "playtimed.notify:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/playtimed"]
