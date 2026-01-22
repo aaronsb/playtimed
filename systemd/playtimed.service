@@ -1,0 +1,22 @@
+[Unit]
+Description=Screen time daemon with personality
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/playtimed/venv/bin/python -m playtimed.main run -c /etc/playtimed/config.yaml
+Restart=always
+RestartSec=10
+Environment=PYTHONPATH=/opt/playtimed/src
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/playtimed
+PrivateTmp=true
+NoNewPrivileges=false
+# Needs to be able to kill user processes
+CapabilityBoundingSet=CAP_KILL CAP_SYS_PTRACE
+
+[Install]
+WantedBy=multi-user.target

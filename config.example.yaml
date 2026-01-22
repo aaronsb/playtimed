@@ -1,0 +1,38 @@
+# playtimed configuration
+# Copy to /etc/playtimed/config.yaml
+
+daemon:
+  poll_interval: 30        # seconds between checks
+  state_dir: /var/lib/playtimed
+  reset_hour: 4            # daily reset at 4am
+
+users:
+  anders:
+    enabled: true
+
+    limits:
+      daily_total: 180     # minutes total screen time
+      gaming: 120          # minutes for games
+
+    schedule:
+      weekday:             # mon-fri
+        allowed_start: "16:00"
+        allowed_end: "21:00"
+      weekend:             # sat-sun
+        allowed_start: "09:00"
+        allowed_end: "22:00"
+
+# Process patterns to monitor
+# Category "gaming" counts against gaming time limit
+processes:
+  gaming:
+    - pattern: "java.*minecraft"
+      name: "Minecraft"
+    - pattern: "minecraft-launcher"
+      name: "Minecraft Launcher"
+    - pattern: "steam"
+      name: "Steam"
+    - pattern: "gamescope"
+      name: "Steam Game"
+    - pattern: "\\.exe$"
+      name: "Windows Game (Proton)"

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "playtimed"
+version = "0.1.0"
+description = "Screen time daemon with personality"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Aaron", email = "aaron@example.com" }
+]
+
+dependencies = [
+    "psutil>=5.9.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+playtimed = "playtimed.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/playtimed"]
+
+[tool.ruff]
+line-length = 100
