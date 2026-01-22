@@ -1,12 +1,14 @@
 """
 D-Bus notification support for playtimed.
 
-Uses the org.freedesktop.Notifications interface which is supported by
-KDE Plasma, GNOME, and other desktop environments.
+Provides a NotificationBackend abstraction with priority-based fallback:
+1. ClippyBackend - Future animated Clippy widget (org.playtimed.Clippy)
+2. FreedesktopBackend - Standard desktop notifications (KDE, GNOME, etc.)
+3. LogOnlyBackend - Fallback when no notification daemon available
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 
 log = logging.getLogger("playtimed.notify")
 
@@ -16,21 +18,164 @@ try:
     DBUS_AVAILABLE = True
 except ImportError:
     DBUS_AVAILABLE = False
-    log.debug("dbus module not available - notifications disabled")
+    log.debug("dbus module not available")
 
 
-class Notifier:
-    """Send desktop notifications via D-Bus."""
+# Urgency levels (shared across backends)
+URGENCY_LOW = 0
+URGENCY_NORMAL = 1
+URGENCY_CRITICAL = 2
 
-    # Notification urgency levels
-    URGENCY_LOW = 0
-    URGENCY_NORMAL = 1
-    URGENCY_CRITICAL = 2
+
+@runtime_checkable
+class NotificationBackend(Protocol):
+    """Protocol for notification delivery backends."""
+
+    @property
+    def name(self) -> str:
+        """Backend identifier for logging."""
+        ...
+
+    def is_available(self) -> bool:
+        """Check if this backend can deliver notifications."""
+        ...
+
+    def send(
+        self,
+        title: str,
+        body: str,
+        urgency: int = URGENCY_NORMAL,
+        icon: str = "dialog-information",
+        replaces_id: int = 0,
+        timeout: int = -1,
+    ) -> int:
+        """
+        Send a notification.
+
+        Returns notification ID (>0) on success, 0 on failure.
+        """
+        ...
+
+    def close(self, notification_id: int) -> bool:
+        """Close/dismiss a notification by ID."""
+        ...
+
+
+class LogOnlyBackend:
+    """Fallback backend that just logs notifications."""
+
+    @property
+    def name(self) -> str:
+        return "log"
+
+    def is_available(self) -> bool:
+        return True  # Always available
+
+    def send(
+        self,
+        title: str,
+        body: str,
+        urgency: int = URGENCY_NORMAL,
+        icon: str = "dialog-information",
+        replaces_id: int = 0,
+        timeout: int = -1,
+    ) -> int:
+        urgency_str = {URGENCY_LOW: "LOW", URGENCY_NORMAL: "NORMAL", URGENCY_CRITICAL: "CRITICAL"}
+        log.info(f"[{urgency_str.get(urgency, '?')}] {title}: {body}")
+        # Return fake ID (negative to distinguish from real IDs)
+        return -1
+
+    def close(self, notification_id: int) -> bool:
+        return True
+
+
+class ClippyBackend:
+    """
+    Future: Animated Clippy notification widget.
+
+    Will connect to org.playtimed.Clippy D-Bus service provided by
+    a KDE Plasma widget.
+    """
+
+    DBUS_SERVICE = "org.playtimed.Clippy"
+    DBUS_PATH = "/org/playtimed/Clippy"
+    DBUS_INTERFACE = "org.playtimed.Clippy"
+
+    def __init__(self):
+        self._available = False
+        self._interface = None
+
+        if DBUS_AVAILABLE:
+            self._connect()
+
+    def _connect(self) -> bool:
+        """Try to connect to Clippy D-Bus service."""
+        try:
+            bus = dbus.SessionBus()
+            # Check if service exists
+            bus.get_name_owner(self.DBUS_SERVICE)
+
+            obj = bus.get_object(self.DBUS_SERVICE, self.DBUS_PATH)
+            self._interface = dbus.Interface(obj, self.DBUS_INTERFACE)
+            self._available = True
+            log.info("Connected to Clippy notification service")
+            return True
+
+        except dbus.exceptions.DBusException:
+            # Service not available - this is expected until widget is built
+            self._available = False
+            return False
+
+    @property
+    def name(self) -> str:
+        return "clippy"
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def send(
+        self,
+        title: str,
+        body: str,
+        urgency: int = URGENCY_NORMAL,
+        icon: str = "dialog-information",
+        replaces_id: int = 0,
+        timeout: int = -1,
+    ) -> int:
+        if not self._available:
+            return 0
+
+        try:
+            # Future: call Clippy D-Bus method
+            # notification_id = self._interface.ShowMessage(title, body, urgency)
+            # return int(notification_id)
+            return 0  # Not implemented yet
+        except dbus.exceptions.DBusException as e:
+            log.error(f"Clippy notification failed: {e}")
+            return 0
+
+    def close(self, notification_id: int) -> bool:
+        if not self._available:
+            return False
+        # Future: self._interface.DismissMessage(notification_id)
+        return False
+
+
+class FreedesktopBackend:
+    """
+    Standard freedesktop.org notification backend.
+
+    Works with KDE Plasma, GNOME, and other compliant desktop environments.
+    """
+
+    DBUS_SERVICE = "org.freedesktop.Notifications"
+    DBUS_PATH = "/org/freedesktop/Notifications"
+    DBUS_INTERFACE = "org.freedesktop.Notifications"
 
     def __init__(self, app_name: str = "playtimed"):
         self.app_name = app_name
         self._bus = None
-        self._notify_interface = None
+        self._interface = None
         self._server_caps = []
         self._server_name = None
         self._available = False
@@ -42,17 +187,11 @@ class Notifier:
         """Connect to the session bus and notification service."""
         try:
             self._bus = dbus.SessionBus()
-            notify_obj = self._bus.get_object(
-                'org.freedesktop.Notifications',
-                '/org/freedesktop/Notifications'
-            )
-            self._notify_interface = dbus.Interface(
-                notify_obj,
-                'org.freedesktop.Notifications'
-            )
+            notify_obj = self._bus.get_object(self.DBUS_SERVICE, self.DBUS_PATH)
+            self._interface = dbus.Interface(notify_obj, self.DBUS_INTERFACE)
 
             # Get server info
-            info = self._notify_interface.GetServerInformation()
+            info = self._interface.GetServerInformation()
             self._server_name = str(info[0])
             server_vendor = str(info[1])
             server_version = str(info[2])
@@ -60,7 +199,7 @@ class Notifier:
                      f"({server_vendor} {server_version})")
 
             # Get capabilities
-            self._server_caps = [str(c) for c in self._notify_interface.GetCapabilities()]
+            self._server_caps = [str(c) for c in self._interface.GetCapabilities()]
             log.debug(f"Server capabilities: {self._server_caps}")
 
             self._available = True
@@ -76,8 +215,10 @@ class Notifier:
             return False
 
     @property
-    def available(self) -> bool:
-        """Check if notifications are available."""
+    def name(self) -> str:
+        return "freedesktop"
+
+    def is_available(self) -> bool:
         return self._available
 
     @property
@@ -105,54 +246,33 @@ class Notifier:
         """Check if notification body supports HTML markup."""
         return 'body-markup' in self._server_caps
 
-    def notify(
+    def send(
         self,
-        summary: str,
-        body: str = "",
-        icon: str = "dialog-information",
+        title: str,
+        body: str,
         urgency: int = URGENCY_NORMAL,
+        icon: str = "dialog-information",
+        replaces_id: int = 0,
         timeout: int = -1,
-        actions: list = None,
-        replaces_id: int = 0
     ) -> int:
-        """
-        Send a notification.
-
-        Args:
-            summary: Notification title
-            body: Notification body text (may support HTML if server allows)
-            icon: Icon name or path
-            urgency: URGENCY_LOW, URGENCY_NORMAL, or URGENCY_CRITICAL
-            timeout: Timeout in ms (-1 for server default, 0 for never)
-            actions: List of [action_id, label, ...] pairs for buttons
-            replaces_id: ID of notification to replace (0 for new)
-
-        Returns:
-            Notification ID (can be used to replace/close later)
-        """
         if not self._available:
-            log.debug(f"Notification (unavailable): {summary}")
             return 0
 
-        if actions is None:
-            actions = []
-
-        hints = {
-            'urgency': dbus.Byte(urgency),
-        }
+        hints = {'urgency': dbus.Byte(urgency)}
+        actions = []
 
         try:
-            notification_id = self._notify_interface.Notify(
-                self.app_name,      # app_name
-                replaces_id,        # replaces_id
-                icon,               # app_icon
-                summary,            # summary
-                body,               # body
-                actions,            # actions
-                hints,              # hints
-                timeout             # expire_timeout
+            notification_id = self._interface.Notify(
+                self.app_name,
+                replaces_id,
+                icon,
+                title,
+                body,
+                actions,
+                hints,
+                timeout
             )
-            log.debug(f"Sent notification {notification_id}: {summary}")
+            log.debug(f"Sent notification {notification_id}: {title}")
             return int(notification_id)
 
         except dbus.exceptions.DBusException as e:
@@ -160,86 +280,116 @@ class Notifier:
             return 0
 
     def close(self, notification_id: int) -> bool:
-        """Close a notification by ID."""
-        if not self._available or notification_id == 0:
+        if not self._available or notification_id <= 0:
             return False
 
         try:
-            self._notify_interface.CloseNotification(notification_id)
+            self._interface.CloseNotification(notification_id)
             return True
         except dbus.exceptions.DBusException:
             return False
 
-    # Convenience methods with Claude personality
+
+class NotificationDispatcher:
+    """
+    Dispatches notifications through available backends with priority fallback.
+
+    Priority order:
+    1. Clippy (animated widget) - if available
+    2. Freedesktop (KDE/GNOME) - standard desktop notifications
+    3. Log-only - always available fallback
+    """
+
+    def __init__(self, app_name: str = "playtimed"):
+        self.backends: list[NotificationBackend] = [
+            ClippyBackend(),
+            FreedesktopBackend(app_name),
+            LogOnlyBackend(),
+        ]
+        self._last_backend: Optional[str] = None
+
+    @property
+    def available_backend(self) -> Optional[NotificationBackend]:
+        """Get the first available backend."""
+        for backend in self.backends:
+            if backend.is_available():
+                return backend
+        return None
+
+    @property
+    def backend_name(self) -> str:
+        """Name of the backend that will be used."""
+        backend = self.available_backend
+        return backend.name if backend else "none"
+
+    def send(
+        self,
+        title: str,
+        body: str,
+        urgency: int = URGENCY_NORMAL,
+        icon: str = "dialog-information",
+        replaces_id: int = 0,
+        timeout: int = -1,
+    ) -> tuple[int, str]:
+        """
+        Send notification through first available backend.
+
+        Returns (notification_id, backend_name).
+        """
+        for backend in self.backends:
+            if backend.is_available():
+                result = backend.send(title, body, urgency, icon, replaces_id, timeout)
+                if result != 0:
+                    self._last_backend = backend.name
+                    return result, backend.name
+        return 0, "failed"
+
+    def close(self, notification_id: int) -> bool:
+        """Close notification using the backend that sent it."""
+        for backend in self.backends:
+            if backend.is_available() and backend.close(notification_id):
+                return True
+        return False
+
+    # Convenience methods with standard messaging
 
     def info(self, message: str, title: str = "Claude says...") -> int:
         """Send an informational notification."""
-        return self.notify(title, message, "dialog-information", self.URGENCY_NORMAL)
+        nid, _ = self.send(title, message, URGENCY_NORMAL, "dialog-information")
+        return nid
 
-    def warning(self, message: str, title: str = "Claude warns...") -> int:
+    def warning(self, message: str, title: str = "Heads up...") -> int:
         """Send a warning notification."""
-        return self.notify(title, message, "dialog-warning", self.URGENCY_NORMAL)
+        nid, _ = self.send(title, message, URGENCY_NORMAL, "dialog-warning")
+        return nid
 
-    def critical(self, message: str, title: str = "Claude ALERT") -> int:
+    def critical(self, message: str, title: str = "Important!") -> int:
         """Send a critical notification that persists."""
-        return self.notify(
-            title, message, "dialog-error",
-            self.URGENCY_CRITICAL, timeout=0
-        )
-
-    def time_warning(self, minutes_left: int, user: str) -> int:
-        """Send a screen time warning."""
-        if minutes_left <= 5:
-            return self.critical(
-                f"Hey {user}! Only {minutes_left} minutes left. "
-                "Time to wrap up what you're doing!",
-                "Time Almost Up!"
-            )
-        elif minutes_left <= 15:
-            return self.warning(
-                f"{minutes_left} minutes of screen time remaining. "
-                "Maybe start thinking about a good stopping point?",
-                "Time Check"
-            )
-        else:
-            return self.info(
-                f"Just a heads up - you have {minutes_left} minutes left today.",
-                "Time Update"
-            )
-
-    def discovery_notice(self, app_name: str, user: str) -> int:
-        """Notify about a newly discovered application."""
-        return self.info(
-            f"I noticed you're running '{app_name}'. "
-            "I'll keep an eye on it. If it's a game, your parents might "
-            "want to add it to the monitored list.",
-            "New App Detected"
-        )
-
-    def enforcement_notice(self, app_name: str, reason: str) -> int:
-        """Notify about app termination."""
-        return self.critical(
-            f"I had to close '{app_name}'. {reason}\n\n"
-            "If you think this is a mistake, talk to your parents.",
-            "App Closed"
-        )
+        nid, _ = self.send(title, message, URGENCY_CRITICAL, "dialog-error", timeout=0)
+        return nid
 
 
-# Module-level singleton for easy access
-_notifier: Optional[Notifier] = None
+# Module-level singleton
+_dispatcher: Optional[NotificationDispatcher] = None
 
 
-def get_notifier() -> Notifier:
-    """Get the global notifier instance."""
-    global _notifier
-    if _notifier is None:
-        _notifier = Notifier()
-    return _notifier
+def get_dispatcher() -> NotificationDispatcher:
+    """Get the global notification dispatcher."""
+    global _dispatcher
+    if _dispatcher is None:
+        _dispatcher = NotificationDispatcher()
+    return _dispatcher
 
 
-def notify(summary: str, body: str = "", **kwargs) -> int:
+def send(title: str, body: str = "", **kwargs) -> int:
     """Convenience function to send a notification."""
-    return get_notifier().notify(summary, body, **kwargs)
+    nid, _ = get_dispatcher().send(title, body, **kwargs)
+    return nid
+
+
+# Backwards compatibility alias
+Notifier = FreedesktopBackend
+get_notifier = lambda: get_dispatcher().backends[1]  # FreedesktopBackend
 
 
 # CLI for testing
@@ -249,7 +399,7 @@ def main():
     import sys
 
     parser = argparse.ArgumentParser(
-        description="Test playtimed D-Bus notifications"
+        description="Test playtimed notification backends"
     )
     parser.add_argument("message", nargs="?", default="Hello from Claude!",
                         help="Message to send")
@@ -260,61 +410,55 @@ def main():
     parser.add_argument("-u", "--urgency", choices=["low", "normal", "critical"],
                         default="normal", help="Urgency level")
     parser.add_argument("--info", action="store_true",
-                        help="Show server info and exit")
-    parser.add_argument("--time-warning", type=int, metavar="MINUTES",
-                        help="Send a time warning notification")
-    parser.add_argument("--discovery", metavar="APP_NAME",
-                        help="Send a discovery notification")
+                        help="Show backend info and exit")
+    parser.add_argument("--backend", choices=["clippy", "freedesktop", "log"],
+                        help="Force specific backend")
 
     args = parser.parse_args()
 
-    # Set up logging
     logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 
-    notifier = Notifier()
-
-    if not notifier.available:
-        print("ERROR: D-Bus notifications not available", file=sys.stderr)
-        print("\nPossible causes:")
-        print("  - dbus-python not installed (pip install dbus-python)")
-        print("  - No notification daemon running")
-        print("  - Not running in a desktop session")
-        sys.exit(1)
+    dispatcher = NotificationDispatcher()
 
     if args.info:
-        print(f"Server: {notifier.server_name}")
-        print(f"Is KDE: {notifier.is_kde}")
-        print(f"Supports actions: {notifier.supports_actions}")
-        print(f"Supports persistence: {notifier.supports_persistence}")
-        print(f"Supports markup: {notifier.supports_body_markup}")
+        print("Available backends:")
+        for backend in dispatcher.backends:
+            status = "available" if backend.is_available() else "unavailable"
+            print(f"  {backend.name}: {status}")
+
+            if isinstance(backend, FreedesktopBackend) and backend.is_available():
+                print(f"    Server: {backend.server_name}")
+                print(f"    Is KDE: {backend.is_kde}")
+                print(f"    Supports actions: {backend.supports_actions}")
+                print(f"    Supports persistence: {backend.supports_persistence}")
+
+        print(f"\nWill use: {dispatcher.backend_name}")
         sys.exit(0)
 
-    if args.time_warning:
-        nid = notifier.time_warning(args.time_warning, "Anders")
-        print(f"Sent time warning (id={nid})")
-        sys.exit(0)
-
-    if args.discovery:
-        nid = notifier.discovery_notice(args.discovery, "Anders")
-        print(f"Sent discovery notice (id={nid})")
-        sys.exit(0)
-
-    # Regular message
     urgency_map = {
-        "low": Notifier.URGENCY_LOW,
-        "normal": Notifier.URGENCY_NORMAL,
-        "critical": Notifier.URGENCY_CRITICAL,
+        "low": URGENCY_LOW,
+        "normal": URGENCY_NORMAL,
+        "critical": URGENCY_CRITICAL,
     }
 
-    nid = notifier.notify(
-        args.title,
-        args.message,
-        icon=args.icon,
-        urgency=urgency_map[args.urgency]
-    )
+    # Send via specific backend or dispatcher
+    if args.backend:
+        backend = next((b for b in dispatcher.backends if b.name == args.backend), None)
+        if not backend:
+            print(f"Unknown backend: {args.backend}", file=sys.stderr)
+            sys.exit(1)
+        if not backend.is_available():
+            print(f"Backend {args.backend} not available", file=sys.stderr)
+            sys.exit(1)
+        nid = backend.send(args.title, args.message, urgency_map[args.urgency], args.icon)
+        backend_used = args.backend
+    else:
+        nid, backend_used = dispatcher.send(
+            args.title, args.message, urgency_map[args.urgency], args.icon
+        )
 
     if nid:
-        print(f"Notification sent (id={nid})")
+        print(f"Notification sent via {backend_used} (id={nid})")
     else:
         print("Failed to send notification", file=sys.stderr)
         sys.exit(1)
