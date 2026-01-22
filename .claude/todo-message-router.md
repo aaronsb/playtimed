@@ -26,11 +26,11 @@ Design: `docs/message-router-design.md`
 - [x] Add delivery logging
 
 ## Phase 3: State Machine Integration
-- [ ] Add state tracking to `_process_user()`
-- [ ] Implement state transitions
-- [ ] Add warning flags (warned_30, warned_15, warned_5)
-- [ ] Update to timestamp-based time tracking
-- [ ] Handle suspend/resume (cap elapsed time)
+- [x] Add state tracking to `_process_user()`
+- [x] Implement state transitions
+- [x] Add warning flags (warned_30, warned_15, warned_5)
+- [x] Update to timestamp-based time tracking
+- [x] Handle suspend/resume (cap elapsed time)
 
 ## Phase 4: CLI & Testing
 - [ ] `playtimed message test <intention>` command

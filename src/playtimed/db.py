@@ -413,6 +413,11 @@ def _seed_default_templates(conn):
         ('mode_change', 0, 'Mode changed',
          'Switching to {mode} mode.',
          'dialog-information', 'normal'),
+
+        # strict_warning - unknown process in strict mode
+        ('strict_warning', 0, 'Unknown application',
+         'I do not recognize {process}. It will be closed in {grace_seconds} seconds unless approved.',
+         'dialog-warning', 'critical'),
     ]
 
     for intention, variant, title, body, icon, urgency in templates:
