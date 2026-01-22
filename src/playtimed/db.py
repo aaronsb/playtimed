@@ -135,6 +135,39 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 description TEXT
             );
 
+            -- Message templates for notifications
+            CREATE TABLE IF NOT EXISTS message_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intention TEXT NOT NULL,
+                variant INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                icon TEXT DEFAULT 'dialog-information',
+                urgency TEXT DEFAULT 'normal',
+                enabled INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(intention, variant)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_templates_intention
+                ON message_templates(intention, enabled);
+
+            -- Message delivery log
+            CREATE TABLE IF NOT EXISTS message_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                user TEXT NOT NULL,
+                intention TEXT NOT NULL,
+                template_id INTEGER,
+                rendered_title TEXT,
+                rendered_body TEXT,
+                notification_id INTEGER,
+                backend TEXT,
+                FOREIGN KEY (template_id) REFERENCES message_templates(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_message_log_user_time
+                ON message_log(user, timestamp);
         """)
 
         # Seed default discovery config
@@ -226,6 +259,167 @@ def migrate_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 ('strict_grace_seconds', '30', 'Grace period before terminating in strict mode');
         """)
 
+        # Create message router tables
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS message_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intention TEXT NOT NULL,
+                variant INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                icon TEXT DEFAULT 'dialog-information',
+                urgency TEXT DEFAULT 'normal',
+                enabled INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(intention, variant)
+            );
+
+            CREATE TABLE IF NOT EXISTS message_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                user TEXT NOT NULL,
+                intention TEXT NOT NULL,
+                template_id INTEGER,
+                rendered_title TEXT,
+                rendered_body TEXT,
+                notification_id INTEGER,
+                backend TEXT,
+                FOREIGN KEY (template_id) REFERENCES message_templates(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_templates_intention
+                ON message_templates(intention, enabled);
+            CREATE INDEX IF NOT EXISTS idx_message_log_user_time
+                ON message_log(user, timestamp);
+        """)
+
+        # Add state tracking columns to daily_summary if not present
+        cursor = conn.execute("PRAGMA table_info(daily_summary)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        if 'state' not in columns:
+            conn.executescript("""
+                ALTER TABLE daily_summary ADD COLUMN state TEXT DEFAULT 'available';
+                ALTER TABLE daily_summary ADD COLUMN gaming_active INTEGER DEFAULT 0;
+                ALTER TABLE daily_summary ADD COLUMN gaming_started_at TEXT;
+                ALTER TABLE daily_summary ADD COLUMN last_poll_at TEXT;
+                ALTER TABLE daily_summary ADD COLUMN warned_30 INTEGER DEFAULT 0;
+                ALTER TABLE daily_summary ADD COLUMN warned_15 INTEGER DEFAULT 0;
+                ALTER TABLE daily_summary ADD COLUMN warned_5 INTEGER DEFAULT 0;
+            """)
+
+        # Seed default message templates if empty
+        count = conn.execute("SELECT COUNT(*) FROM message_templates").fetchone()[0]
+        if count == 0:
+            _seed_default_templates(conn)
+
+
+def _seed_default_templates(conn):
+    """Seed default message templates."""
+    now = datetime.now().isoformat()
+
+    templates = [
+        # process_start - when a tracked game begins
+        ('process_start', 0, 'Have fun!',
+         'Starting up {process}! You have {time_left} minutes of gaming time today.',
+         'dialog-information', 'normal'),
+        ('process_start', 1, '{process}',
+         'Nice choice, {user}. {time_left} minutes available - enjoy!',
+         'dialog-information', 'normal'),
+        ('process_start', 2, 'Game time',
+         '{process} is running. You have {time_left} minutes today.',
+         'dialog-information', 'normal'),
+
+        # process_end - when a tracked game exits
+        ('process_end', 0, 'Session ended',
+         'Done with {process}? You have {time_left} minutes left for today.',
+         'dialog-information', 'low'),
+        ('process_end', 1, 'See you later',
+         '{process} closed. {time_left} minutes remaining if you want to play more.',
+         'dialog-information', 'low'),
+
+        # time_warning - approaching limit (30 min)
+        ('time_warning_30', 0, 'Time check',
+         'Half hour left for today, {user}. Just a heads up!',
+         'dialog-information', 'normal'),
+        ('time_warning_30', 1, '30 minutes left',
+         'You have 30 minutes of gaming time remaining today.',
+         'dialog-information', 'normal'),
+
+        # time_warning - 15 min
+        ('time_warning_15', 0, '15 minutes left',
+         'Getting close, {user}. Maybe start thinking about a save point?',
+         'dialog-warning', 'normal'),
+        ('time_warning_15', 1, 'Heads up',
+         '15 minutes remaining. Good time to wrap up what you are doing.',
+         'dialog-warning', 'normal'),
+
+        # time_warning - 5 min
+        ('time_warning_5', 0, 'Almost time',
+         'Just 5 minutes left, {user}. Time to save and finish up!',
+         'dialog-warning', 'normal'),
+        ('time_warning_5', 1, '5 minutes!',
+         'Wrapping up time - 5 minutes remaining for today.',
+         'dialog-warning', 'normal'),
+
+        # time_expired - limit reached
+        ('time_expired', 0, 'Time is up',
+         'That is your gaming time for today, {user}. Save your game now!',
+         'dialog-warning', 'critical'),
+        ('time_expired', 1, 'Limit reached',
+         'You have used your {time_limit} minutes for today. Time to save!',
+         'dialog-warning', 'critical'),
+
+        # grace_period - countdown before enforcement
+        ('grace_period', 0, 'Saving time',
+         '{grace_seconds} seconds to save your game before I need to close it.',
+         'dialog-warning', 'critical'),
+
+        # enforcement - app was terminated
+        ('enforcement', 0, 'Game closed',
+         'Had to close {process}. Your time is up for today.',
+         'dialog-error', 'critical'),
+        ('enforcement', 1, 'Session ended',
+         '{process} was closed. Tomorrow is another day!',
+         'dialog-error', 'critical'),
+
+        # blocked_launch - tried to start game when not allowed
+        ('blocked_launch', 0, 'Not right now',
+         'Cannot start {process} - you have used your gaming time for today.',
+         'dialog-error', 'critical'),
+        ('blocked_launch', 1, 'Time is up',
+         '{process} is blocked. Your gaming time resets tomorrow.',
+         'dialog-error', 'critical'),
+
+        # outside_hours - tried to play outside allowed hours
+        ('outside_hours', 0, 'Outside gaming hours',
+         'Gaming is available from {start_time} to {end_time}. Come back later!',
+         'dialog-information', 'normal'),
+
+        # discovery - new process detected
+        ('discovery', 0, 'New app detected',
+         'I noticed {process} running. I will keep an eye on it.',
+         'dialog-information', 'low'),
+        ('discovery', 1, 'Spotted something new',
+         '{process} is new to me. If it is a game, it might get added to tracking.',
+         'dialog-information', 'low'),
+
+        # day_reset - new day begins
+        ('day_reset', 0, 'Good morning!',
+         'New day, fresh start! You have {time_limit} minutes of gaming time today.',
+         'dialog-information', 'normal'),
+
+        # mode_change - daemon mode changed
+        ('mode_change', 0, 'Mode changed',
+         'Switching to {mode} mode.',
+         'dialog-information', 'normal'),
+    ]
+
+    for intention, variant, title, body, icon, urgency in templates:
+        conn.execute("""
+            INSERT INTO message_templates (intention, variant, title, body, icon, urgency, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (intention, variant, title, body, icon, urgency, now))
 
 
 @contextmanager
@@ -772,7 +966,8 @@ class ActivityDB:
 
         return stats
 
-    def maintenance(self, events_days: int = 30, sessions_days: int = 90) -> dict:
+    def maintenance(self, events_days: int = 30, sessions_days: int = 90,
+                    message_log_days: int = 7) -> dict:
         """Run full maintenance cycle: cleanup + vacuum.
 
         Call this periodically (e.g., daily via cron or on daemon startup).
@@ -781,6 +976,9 @@ class ActivityDB:
             'before': self.get_db_stats(),
             'deleted': self.cleanup_old_data(events_days, sessions_days),
         }
+
+        # Also clean up message log
+        result['deleted']['message_log'] = self.cleanup_message_log(message_log_days)
 
         self.vacuum()
 
@@ -806,3 +1004,187 @@ class ActivityDB:
                 "SELECT * FROM process_patterns WHERE id = ?", (pattern_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    # --- Message Templates ---
+
+    def get_templates(self, intention: str, enabled_only: bool = True) -> list[dict]:
+        """Get all templates for an intention."""
+        with get_connection(self.db_path) as conn:
+            if enabled_only:
+                rows = conn.execute("""
+                    SELECT * FROM message_templates
+                    WHERE intention = ? AND enabled = 1
+                    ORDER BY variant
+                """, (intention,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM message_templates
+                    WHERE intention = ?
+                    ORDER BY variant
+                """, (intention,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_template(self, intention: str, variant: int = 0) -> Optional[dict]:
+        """Get a specific template by intention and variant."""
+        with get_connection(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT * FROM message_templates
+                WHERE intention = ? AND variant = ? AND enabled = 1
+            """, (intention, variant)).fetchone()
+            return dict(row) if row else None
+
+    def get_random_template(self, intention: str) -> Optional[dict]:
+        """Get a random enabled template for an intention."""
+        with get_connection(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT * FROM message_templates
+                WHERE intention = ? AND enabled = 1
+                ORDER BY RANDOM()
+                LIMIT 1
+            """, (intention,)).fetchone()
+            return dict(row) if row else None
+
+    def get_all_templates(self) -> list[dict]:
+        """Get all templates for listing."""
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute("""
+                SELECT * FROM message_templates
+                ORDER BY intention, variant
+            """).fetchall()
+            return [dict(row) for row in rows]
+
+    def add_template(self, intention: str, title: str, body: str,
+                     variant: int = None, icon: str = "dialog-information",
+                     urgency: str = "normal") -> int:
+        """Add a new message template."""
+        now = datetime.now().isoformat()
+
+        with get_connection(self.db_path) as conn:
+            # Auto-assign variant if not specified
+            if variant is None:
+                result = conn.execute("""
+                    SELECT COALESCE(MAX(variant), -1) + 1 FROM message_templates
+                    WHERE intention = ?
+                """, (intention,)).fetchone()
+                variant = result[0]
+
+            cursor = conn.execute("""
+                INSERT INTO message_templates
+                    (intention, variant, title, body, icon, urgency, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (intention, variant, title, body, icon, urgency, now))
+            return cursor.lastrowid
+
+    def update_template(self, template_id: int, **kwargs):
+        """Update a template."""
+        allowed = {'title', 'body', 'icon', 'urgency', 'enabled'}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+
+        set_clause = ', '.join(f"{k} = ?" for k in updates.keys())
+        with get_connection(self.db_path) as conn:
+            conn.execute(
+                f"UPDATE message_templates SET {set_clause} WHERE id = ?",
+                (*updates.values(), template_id)
+            )
+
+    def delete_template(self, template_id: int):
+        """Delete a template."""
+        with get_connection(self.db_path) as conn:
+            conn.execute("DELETE FROM message_templates WHERE id = ?", (template_id,))
+
+    # --- Message Log ---
+
+    def log_message(self, user: str, intention: str, template_id: int,
+                    rendered_title: str, rendered_body: str,
+                    notification_id: int = 0, backend: str = None) -> int:
+        """Log a sent message."""
+        now = datetime.now().isoformat()
+        with get_connection(self.db_path) as conn:
+            cursor = conn.execute("""
+                INSERT INTO message_log
+                    (timestamp, user, intention, template_id,
+                     rendered_title, rendered_body, notification_id, backend)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (now, user, intention, template_id,
+                  rendered_title, rendered_body, notification_id, backend))
+            return cursor.lastrowid
+
+    def get_recent_messages(self, user: str = None, limit: int = 50) -> list[dict]:
+        """Get recent message log entries."""
+        with get_connection(self.db_path) as conn:
+            if user:
+                rows = conn.execute("""
+                    SELECT * FROM message_log
+                    WHERE user = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (user, limit)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM message_log
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (limit,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def cleanup_message_log(self, days: int = 7) -> int:
+        """Delete message_log entries older than N days."""
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        with get_connection(self.db_path) as conn:
+            cursor = conn.execute(
+                "DELETE FROM message_log WHERE timestamp < ?", (cutoff,)
+            )
+            return cursor.rowcount
+
+    # --- User State (for message router) ---
+
+    def get_user_state(self, user: str) -> Optional[dict]:
+        """Get current user state from daily_summary."""
+        today = date.today().isoformat()
+        with get_connection(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT state, gaming_active, gaming_started_at, last_poll_at,
+                       warned_30, warned_15, warned_5,
+                       gaming_time, total_time
+                FROM daily_summary
+                WHERE user = ? AND date = ?
+            """, (user, today)).fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    def update_user_state(self, user: str, **kwargs):
+        """Update user state in daily_summary (upsert)."""
+        today = date.today().isoformat()
+        allowed = {'state', 'gaming_active', 'gaming_started_at', 'last_poll_at',
+                   'warned_30', 'warned_15', 'warned_5', 'gaming_time', 'total_time'}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+
+        if not updates:
+            return
+
+        with get_connection(self.db_path) as conn:
+            # Check if row exists
+            exists = conn.execute("""
+                SELECT 1 FROM daily_summary WHERE user = ? AND date = ?
+            """, (user, today)).fetchone()
+
+            if exists:
+                set_clause = ', '.join(f"{k} = ?" for k in updates.keys())
+                conn.execute(
+                    f"UPDATE daily_summary SET {set_clause} WHERE user = ? AND date = ?",
+                    (*updates.values(), user, today)
+                )
+            else:
+                # Insert new row with defaults
+                updates['date'] = today
+                updates['user'] = user
+                columns = ', '.join(updates.keys())
+                placeholders = ', '.join('?' * len(updates))
+                conn.execute(
+                    f"INSERT INTO daily_summary ({columns}) VALUES ({placeholders})",
+                    tuple(updates.values())
+                )

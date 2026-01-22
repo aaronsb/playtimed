@@ -11,12 +11,12 @@ Design: `docs/message-router-design.md`
 - [x] Add placeholder for `ClippyBackend`
 
 ## Phase 1: Database & Templates
-- [ ] Add migration function for new schema
-- [ ] Create `message_templates` table
-- [ ] Create `message_log` table
-- [ ] Seed default templates (3 variants per intention)
-- [ ] Add state columns to `daily_summary`
-- [ ] Add `message_log` cleanup to maintenance
+- [x] Add migration function for new schema
+- [x] Create `message_templates` table
+- [x] Create `message_log` table
+- [x] Seed default templates (3 variants per intention)
+- [x] Add state columns to `daily_summary`
+- [x] Add `message_log` cleanup to maintenance
 
 ## Phase 2: Message Router
 - [ ] Create `router.py` module

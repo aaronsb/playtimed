@@ -291,3 +291,122 @@ class TestPatternNotes:
         """Test getting a pattern that doesn't exist."""
         pattern = db.get_pattern_by_id(9999)
         assert pattern is None
+
+
+class TestMessageTemplates:
+    """Tests for message templates."""
+
+    def test_default_templates_seeded(self, db):
+        """Test that default templates are seeded on init."""
+        templates = db.get_all_templates()
+        assert len(templates) > 0
+
+        # Check for some expected intentions
+        intentions = {t['intention'] for t in templates}
+        assert 'process_start' in intentions
+        assert 'time_warning_30' in intentions
+        assert 'enforcement' in intentions
+
+    def test_get_templates_by_intention(self, db):
+        """Test getting templates by intention."""
+        templates = db.get_templates('process_start')
+        assert len(templates) >= 2  # We seeded multiple variants
+
+        for t in templates:
+            assert t['intention'] == 'process_start'
+
+    def test_get_random_template(self, db):
+        """Test getting a random template."""
+        template = db.get_random_template('process_start')
+        assert template is not None
+        assert template['intention'] == 'process_start'
+
+    def test_add_custom_template(self, db):
+        """Test adding a custom template."""
+        template_id = db.add_template(
+            intention='process_start',
+            title='Custom Title',
+            body='Custom body with {user}',
+            icon='custom-icon'
+        )
+        assert template_id > 0
+
+        template = db.get_templates('process_start', enabled_only=False)
+        custom = [t for t in template if t['title'] == 'Custom Title']
+        assert len(custom) == 1
+        assert custom[0]['body'] == 'Custom body with {user}'
+
+
+class TestMessageLog:
+    """Tests for message logging."""
+
+    def test_log_message(self, db):
+        """Test logging a message."""
+        log_id = db.log_message(
+            user='anders',
+            intention='process_start',
+            template_id=1,
+            rendered_title='Test Title',
+            rendered_body='Test Body',
+            notification_id=123,
+            backend='freedesktop'
+        )
+        assert log_id > 0
+
+    def test_get_recent_messages(self, db):
+        """Test getting recent messages."""
+        db.log_message('anders', 'process_start', 1, 'T1', 'B1', 1, 'freedesktop')
+        db.log_message('anders', 'time_warning_30', 2, 'T2', 'B2', 2, 'freedesktop')
+        db.log_message('other', 'process_start', 1, 'T3', 'B3', 3, 'freedesktop')
+
+        # Get all messages
+        all_msgs = db.get_recent_messages()
+        assert len(all_msgs) == 3
+
+        # Get messages for specific user
+        anders_msgs = db.get_recent_messages(user='anders')
+        assert len(anders_msgs) == 2
+
+    def test_cleanup_message_log(self, db):
+        """Test message log cleanup."""
+        db.log_message('anders', 'test', 1, 'T', 'B', 1, 'test')
+
+        # Cleanup with 0 days should delete everything
+        # (but our message was just created, so use negative to test)
+        deleted = db.cleanup_message_log(days=30)
+        # Message was just created, so shouldn't be deleted
+        assert deleted == 0
+
+
+class TestUserState:
+    """Tests for user state tracking."""
+
+    def test_get_user_state_empty(self, db):
+        """Test getting state for user with no data."""
+        state = db.get_user_state('newuser')
+        assert state is None
+
+    def test_update_and_get_user_state(self, db):
+        """Test updating and getting user state."""
+        db.update_user_state('anders', state='available', gaming_active=0)
+
+        state = db.get_user_state('anders')
+        assert state is not None
+        assert state['state'] == 'available'
+        assert state['gaming_active'] == 0
+
+    def test_update_user_state_gaming(self, db):
+        """Test tracking gaming state."""
+        db.update_user_state('anders', gaming_active=1, gaming_time=300)
+
+        state = db.get_user_state('anders')
+        assert state['gaming_active'] == 1
+        assert state['gaming_time'] == 300
+
+    def test_warning_flags(self, db):
+        """Test warning flag tracking."""
+        db.update_user_state('anders', warned_30=1, warned_15=0, warned_5=0)
+
+        state = db.get_user_state('anders')
+        assert state['warned_30'] == 1
+        assert state['warned_15'] == 0
