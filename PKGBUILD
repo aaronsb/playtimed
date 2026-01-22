@@ -23,10 +23,11 @@ optdepends=(
 backup=(
     'etc/playtimed/config.yaml'
 )
+install=playtimed.install
 source=(
     "$pkgname-$pkgver.tar.gz::https://github.com/aaronsb/playtimed/archive/v$pkgver.tar.gz"
 )
-sha256sums=('b8fb085649b67b352c6c97f1dd889c9b473aff91764975418107b7082a620447')
+sha256sums=('SKIP')  # Will update after pushing install script
 
 build() {
     cd "$srcdir/$pkgname-$pkgver"
@@ -67,14 +68,4 @@ EOF
     # Install documentation
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md" 2>/dev/null || true
     install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md" 2>/dev/null || true
-}
-
-post_install() {
-    echo "==> playtimed installed successfully!"
-    echo "==> Configure users: sudo playtimed user add <username> --gaming-limit 120"
-    echo "==> Start daemon: sudo systemctl enable --now playtimed"
-}
-
-post_upgrade() {
-    echo "==> Run 'sudo systemctl restart playtimed' to apply changes"
 }

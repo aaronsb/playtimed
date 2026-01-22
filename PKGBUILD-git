@@ -26,6 +26,7 @@ conflicts=('playtimed')
 backup=(
     'etc/playtimed/config.yaml'
 )
+install=playtimed.install
 source=("git+https://github.com/aaronsb/playtimed.git")
 sha256sums=('SKIP')
 
