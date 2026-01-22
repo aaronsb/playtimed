@@ -26,7 +26,7 @@ backup=(
 source=(
     "$pkgname-$pkgver.tar.gz::https://github.com/aaronsb/playtimed/archive/v$pkgver.tar.gz"
 )
-sha256sums=('SKIP')  # Update after first release
+sha256sums=('b8fb085649b67b352c6c97f1dd889c9b473aff91764975418107b7082a620447')
 
 build() {
     cd "$srcdir/$pkgname-$pkgver"
