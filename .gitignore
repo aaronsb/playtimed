@@ -38,3 +38,11 @@ htmlcov/
 
 # Project specific
 *.db
+
+# AUR/makepkg artifacts
+src/
+pkg/
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.src.tar.gz
+.SRCINFO

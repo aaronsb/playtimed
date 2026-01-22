@@ -1,0 +1,78 @@
+# Maintainer: Aaron Bockelie <aaronsb@gmail.com>
+pkgname=playtimed-git
+pkgver=0.2.0.r0.g436334f
+pkgrel=1
+pkgdesc="Screen time daemon with personality - parental controls with Claude AI character (git version)"
+arch=('any')
+url="https://github.com/aaronsb/playtimed"
+license=('MIT')
+depends=(
+    'python>=3.10'
+    'python-psutil'
+    'python-yaml'
+    'python-dbus'
+)
+makedepends=(
+    'python-build'
+    'python-installer'
+    'python-hatchling'
+    'git'
+)
+optdepends=(
+    'kde-cli-tools: For KDE notification integration'
+)
+provides=('playtimed')
+conflicts=('playtimed')
+backup=(
+    'etc/playtimed/config.yaml'
+)
+source=("git+https://github.com/aaronsb/playtimed.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "playtimed"
+    printf "%s.r%s.g%s" \
+        "$(grep '^version' pyproject.toml | cut -d '"' -f2)" \
+        "$(git rev-list --count HEAD)" \
+        "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cd "$srcdir/playtimed"
+    python -m build --wheel --no-isolation
+}
+
+package() {
+    cd "$srcdir/playtimed"
+
+    # Install Python package
+    python -m installer --destdir="$pkgdir" dist/*.whl
+
+    # Install systemd service
+    install -Dm644 systemd/playtimed.service.pkg "$pkgdir/usr/lib/systemd/system/playtimed.service"
+
+    # Create config directory and install default config
+    install -dm755 "$pkgdir/etc/playtimed"
+    if [[ -f config/config.yaml ]]; then
+        install -Dm644 config/config.yaml "$pkgdir/etc/playtimed/config.yaml"
+    else
+        cat > "$pkgdir/etc/playtimed/config.yaml" << EOF
+# playtimed configuration
+daemon:
+  poll_interval: 30
+  db_path: /var/lib/playtimed/playtimed.db
+  reset_hour: 4
+EOF
+    fi
+
+    # Create data directory
+    install -dm755 "$pkgdir/var/lib/playtimed"
+
+    # Install license
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || \
+        echo "MIT License" > "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # Install documentation
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md" 2>/dev/null || true
+    install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md" 2>/dev/null || true
+}
