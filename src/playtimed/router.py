@@ -127,13 +127,15 @@ class MessageRouter:
         if replace_previous and intention in self._last_notification:
             replaces_id = self._last_notification[intention]
 
-        # Send via dispatcher
+        # Send via dispatcher (target user's session bus if we know the user)
+        target_user = ctx_dict.get('user') or None
         notification_id, backend = self.dispatcher.send(
             title=title,
             body=body,
             urgency=urgency,
             icon=template['icon'],
             replaces_id=replaces_id,
+            target_user=target_user,
         )
 
         # Track for potential replacement
@@ -186,7 +188,10 @@ class MessageRouter:
         title = self._render(title, context)
         body = self._render(body, context)
 
-        notification_id, backend = self.dispatcher.send(title, body)
+        target_user = context.get('user') or None
+        notification_id, backend = self.dispatcher.send(
+            title, body, target_user=target_user
+        )
 
         # Log even fallback messages
         self._log_message(

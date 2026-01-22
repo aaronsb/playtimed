@@ -15,10 +15,43 @@ log = logging.getLogger("playtimed.notify")
 # Try to import dbus
 try:
     import dbus
+    import dbus.bus
     DBUS_AVAILABLE = True
 except ImportError:
     DBUS_AVAILABLE = False
     log.debug("dbus module not available")
+
+import os
+import pwd
+
+
+def get_user_bus_address(username: str) -> Optional[str]:
+    """
+    Get the D-Bus session bus address for a specific user.
+
+    Returns the bus address string (e.g., 'unix:path=/run/user/1000/bus')
+    or None if the user's session bus is not available.
+    """
+    try:
+        # Get UID from username
+        pw_entry = pwd.getpwnam(username)
+        uid = pw_entry.pw_uid
+
+        # Standard location for user session bus
+        bus_path = f"/run/user/{uid}/bus"
+
+        if os.path.exists(bus_path):
+            return f"unix:path={bus_path}"
+
+        log.debug(f"No session bus found for {username} at {bus_path}")
+        return None
+
+    except KeyError:
+        log.warning(f"User {username} not found")
+        return None
+    except Exception as e:
+        log.warning(f"Error getting bus address for {username}: {e}")
+        return None
 
 
 # Urgency levels (shared across backends)
@@ -172,8 +205,9 @@ class FreedesktopBackend:
     DBUS_PATH = "/org/freedesktop/Notifications"
     DBUS_INTERFACE = "org.freedesktop.Notifications"
 
-    def __init__(self, app_name: str = "playtimed"):
+    def __init__(self, app_name: str = "playtimed", bus_address: Optional[str] = None):
         self.app_name = app_name
+        self._bus_address = bus_address
         self._bus = None
         self._interface = None
         self._server_caps = []
@@ -186,7 +220,11 @@ class FreedesktopBackend:
     def _connect(self) -> bool:
         """Connect to the session bus and notification service."""
         try:
-            self._bus = dbus.SessionBus()
+            if self._bus_address:
+                # Connect to specific bus address (e.g., user session)
+                self._bus = dbus.bus.BusConnection(self._bus_address)
+            else:
+                self._bus = dbus.SessionBus()
             notify_obj = self._bus.get_object(self.DBUS_SERVICE, self.DBUS_PATH)
             self._interface = dbus.Interface(notify_obj, self.DBUS_INTERFACE)
 
@@ -298,15 +336,43 @@ class NotificationDispatcher:
     1. Clippy (animated widget) - if available
     2. Freedesktop (KDE/GNOME) - standard desktop notifications
     3. Log-only - always available fallback
+
+    Supports targeting specific users by connecting to their session bus.
     """
 
     def __init__(self, app_name: str = "playtimed"):
+        self.app_name = app_name
+        # Default backends (no specific user target)
         self.backends: list[NotificationBackend] = [
             ClippyBackend(),
             FreedesktopBackend(app_name),
             LogOnlyBackend(),
         ]
         self._last_backend: Optional[str] = None
+        # Cache of user-specific backends: username -> FreedesktopBackend
+        self._user_backends: dict[str, FreedesktopBackend] = {}
+
+    def _get_user_backend(self, username: str) -> Optional[FreedesktopBackend]:
+        """Get or create a backend connected to a specific user's session bus."""
+        if username in self._user_backends:
+            backend = self._user_backends[username]
+            if backend.is_available():
+                return backend
+            # Backend became unavailable, remove from cache
+            del self._user_backends[username]
+
+        # Try to connect to user's session bus
+        bus_address = get_user_bus_address(username)
+        if not bus_address:
+            return None
+
+        backend = FreedesktopBackend(self.app_name, bus_address=bus_address)
+        if backend.is_available():
+            self._user_backends[username] = backend
+            log.info(f"Connected to {username}'s session bus for notifications")
+            return backend
+
+        return None
 
     @property
     def available_backend(self) -> Optional[NotificationBackend]:
@@ -330,12 +396,26 @@ class NotificationDispatcher:
         icon: str = "dialog-information",
         replaces_id: int = 0,
         timeout: int = -1,
+        target_user: Optional[str] = None,
     ) -> tuple[int, str]:
         """
         Send notification through first available backend.
 
+        If target_user is specified, attempts to send to that user's session
+        bus first before falling back to default backends.
+
         Returns (notification_id, backend_name).
         """
+        # Try user-specific backend first if target specified
+        if target_user:
+            user_backend = self._get_user_backend(target_user)
+            if user_backend:
+                result = user_backend.send(title, body, urgency, icon, replaces_id, timeout)
+                if result != 0:
+                    self._last_backend = f"freedesktop@{target_user}"
+                    return result, f"freedesktop@{target_user}"
+
+        # Fall back to default backends
         for backend in self.backends:
             if backend.is_available():
                 result = backend.send(title, body, urgency, icon, replaces_id, timeout)
