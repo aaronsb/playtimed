@@ -22,6 +22,7 @@ import psutil
 import yaml
 
 from .db import ActivityDB
+from .router import MessageRouter, MessageContext, get_router
 
 # Default paths
 DEFAULT_CONFIG = "/etc/playtimed/config.yaml"
@@ -325,6 +326,9 @@ class ClaudeDaemon:
         self.db = ActivityDB(db_path)
         log.info(f"Database initialized at {db_path}")
 
+        # Initialize message router
+        self.router = MessageRouter(self.db)
+
         # Load configs
         self.discovery_config = self.db.get_discovery_config()
         self.daemon_config = self.db.get_daemon_config()
@@ -404,21 +408,8 @@ class ClaudeDaemon:
 
         if old_mode != self.mode:
             log.info(f"Mode changed: {old_mode} -> {self.mode}")
-            # Notify all users about mode change
-            for user in self.users:
-                notifier = self._get_notifier(user)
-                if self.mode == 'passthrough':
-                    notifier.send("🔓 Passthrough Mode",
-                                  "I'm now in passthrough mode. I'll watch but won't enforce limits.",
-                                  urgency="low")
-                elif self.mode == 'strict':
-                    notifier.send("🔒 Strict Mode",
-                                  "I'm now in strict mode. Unknown applications will be terminated.",
-                                  urgency="critical")
-                elif self.mode == 'normal':
-                    notifier.send("✅ Normal Mode",
-                                  "I'm back to normal mode. Regular rules apply.",
-                                  urgency="normal")
+            # Notify all users about mode change via router
+            self.router.mode_change(self.mode)
 
     def _load_config(self, path: str) -> dict:
         """Load configuration from YAML file."""
@@ -587,11 +578,8 @@ class ClaudeDaemon:
                         self._kill_process(ProcessMatch(
                             pid=pid, name=proc_name, category="disallowed",
                             cmdline=cmdline[:100], cpu_percent=cpu
-                        ), user, notify=True, reason="BLOCKED")
-                        notifier = self._get_notifier(user)
-                        notifier.send("🚫 Blocked",
-                                      f"I stopped {proc_name} - it's on the not-allowed list.",
-                                      urgency="critical")
+                        ), user, notify=False)
+                        self.router.blocked_launch(user, proc_name)
 
                     # Remove from strict pending if it's a known pattern (active/ignored)
                     if pid in self.strict_pending and state in ('active', 'ignored'):
@@ -618,7 +606,6 @@ class ClaudeDaemon:
                                 pid: int, cpu: float, grace_seconds: int):
         """Handle unknown processes in strict mode - warn then kill after grace period."""
         now = time.time()
-        notifier = self._get_notifier(user)
 
         if pid not in self.strict_pending:
             # First time seeing this - warn and start countdown
@@ -630,10 +617,9 @@ class ClaudeDaemon:
             }
             log.warning(f"[STRICT] Unknown process {proc_name} (PID {pid}) - warning sent, "
                         f"will terminate in {grace_seconds}s")
-            notifier.send("⚠️ Unknown Application",
-                          f"I don't recognize {proc_name}. "
-                          f"It will be closed in {grace_seconds} seconds unless it's approved.",
-                          urgency="critical")
+            # Send warning via router (uses 'blocked_launch' intention for unknown apps)
+            ctx = MessageContext(user=user, process=proc_name, grace_seconds=grace_seconds)
+            self.router.send('strict_warning', ctx)
             # Also discover it so admin can review
             self._check_discovery(user, proc_name, cmdline, pid, cpu)
         else:
@@ -646,10 +632,8 @@ class ClaudeDaemon:
                 self._kill_process(ProcessMatch(
                     pid=pid, name=proc_name, category="unknown",
                     cmdline=cmdline[:100], cpu_percent=cpu
-                ), user, notify=True, reason="BLOCKED")
-                notifier.send("🚫 Unknown App Closed",
-                              f"I closed {proc_name} because it wasn't on the approved list.",
-                              urgency="critical")
+                ), user, notify=False)
+                self.router.enforcement(user, proc_name)
                 del self.strict_pending[pid]
 
     def _check_discovery(self, user: str, proc_name: str, cmdline: str, pid: int, cpu: float):
@@ -710,13 +694,8 @@ class ClaudeDaemon:
             # Record the PID
             self.db.record_pid_seen(pattern_id, pid)
 
-            # Notify the user
-            notifier = self._get_notifier(user)
-            notifier.send("👀 New Application Detected",
-                          f"I noticed {proc_name} using a lot of CPU. "
-                          f"I've added it to my discovery list. "
-                          f"Your dad can review it later.",
-                          urgency="low")
+            # Notify the user via router
+            self.router.discovery(user, proc_name)
 
             # Clean up
             del self.discovery_candidates[key]
@@ -847,30 +826,69 @@ class ClaudeDaemon:
             log.error(f"Access denied killing PID {proc.pid}")
 
     def _process_user(self, user: str):
-        """Process monitoring for a single user."""
-        user_config = self.config.get("users", {}).get(user, {})
-        if not user_config.get("enabled", True):
+        """Process monitoring for a single user using state machine approach."""
+        # Check if user is enabled in DB
+        limits = self.db.get_user_limits(user)
+        if not limits or not limits.get('enabled', 1):
             return
+
+        poll_interval = self.config["daemon"].get("poll_interval", 30)
+        now = datetime.now()
+        now_iso = now.isoformat()
 
         # Run full process scan (discovery, stats, disallowed termination)
         self._scan_all_processes(user)
 
-        state = self._load_user_state(user)
-        notifier = self._get_notifier(user)
-
-        # Check time restrictions
-        allowed, reason = self._is_allowed_time(user)
-        total_remaining, gaming_remaining = self._get_remaining_time(user)
+        # Load state from database (or create if new day)
+        db_state = self.db.get_user_state(user)
+        was_gaming_active = db_state['gaming_active'] if db_state else 0
+        last_poll_at = db_state.get('last_poll_at') if db_state else None
 
         # Find gaming processes
         current_games = self._find_gaming_processes(user)
         prev_games = self.active_games.get(user, {})
+        gaming_active = 1 if current_games else 0
 
         # Track which PIDs we're seeing
         current_pids = {g.pid for g in current_games}
         prev_pids = set(prev_games.keys())
 
-        # New games started
+        # Calculate elapsed time using timestamps (not poll interval)
+        elapsed_seconds = 0
+        if last_poll_at and was_gaming_active:
+            try:
+                last_poll_time = datetime.fromisoformat(last_poll_at)
+                elapsed_seconds = (now - last_poll_time).total_seconds()
+                # Cap elapsed time to handle suspend/resume
+                max_elapsed = poll_interval * 2
+                if elapsed_seconds > max_elapsed:
+                    log.debug(f"Large gap detected ({elapsed_seconds:.0f}s), capping at {max_elapsed}s")
+                    elapsed_seconds = max_elapsed
+            except (ValueError, TypeError):
+                elapsed_seconds = poll_interval
+
+        # Get current time usage
+        total_used, gaming_used = self.db.get_time_used_today(user)
+
+        # Add elapsed time if was gaming
+        if elapsed_seconds > 0 and was_gaming_active:
+            gaming_used += int(elapsed_seconds)
+            total_used += int(elapsed_seconds)
+
+        # Calculate remaining time
+        gaming_limit = limits.get('gaming_limit', 120) * 60  # seconds
+        gaming_remaining = max(0, gaming_limit - gaming_used)
+        gaming_remaining_mins = gaming_remaining // 60
+
+        # Check time restrictions
+        allowed, outside_reason = self._is_allowed_time(user)
+
+        # Get warning flags
+        warned_30 = db_state.get('warned_30', 0) if db_state else 0
+        warned_15 = db_state.get('warned_15', 0) if db_state else 0
+        warned_5 = db_state.get('warned_5', 0) if db_state else 0
+
+        # Process new game starts
         for game in current_games:
             if game.pid not in prev_pids:
                 log.info(f"Detected new game: {game.name} (PID {game.pid}) for {user}")
@@ -880,18 +898,17 @@ class ClaudeDaemon:
                                   category="gaming", pid=game.pid)
 
                 if not allowed:
-                    notifier.send("🚫 Not Now", reason, urgency="critical")
+                    self.router.outside_hours(user, limits.get('weekday_start', ''),
+                                              limits.get('weekday_end', ''))
                     self.db.log_event(user, "blocked_schedule", app=game.name,
-                                      details=reason, pid=game.pid)
-                    self._kill_process(game, user)
+                                      details=outside_reason, pid=game.pid)
+                    self._kill_process(game, user, notify=False)
                     continue
 
                 if gaming_remaining <= 0:
-                    notifier.send("🚫 Time's Up",
-                                 MessageTemplates.get("BLOCKED"),
-                                 urgency="critical")
+                    self.router.blocked_launch(user, game.name)
                     self.db.log_event(user, "blocked_quota", app=game.name, pid=game.pid)
-                    self._kill_process(game, user)
+                    self._kill_process(game, user, notify=False)
                     continue
 
                 # Allowed - start session tracking
@@ -900,40 +917,51 @@ class ClaudeDaemon:
                 self.db.increment_session_count(user)
                 self.db.log_event(user, "game_start", app=game.name, pid=game.pid)
 
-                # Send notification
-                notifier.send("🎮 Game On",
-                             MessageTemplates.get("GAME_START",
-                                                 app=game.name,
-                                                 gaming_remaining=format_duration(gaming_remaining)))
+                # Send notification via router
+                self.router.process_started(user, game.name, gaming_remaining_mins)
 
         # Update active games
         self.active_games[user] = {g.pid: g for g in current_games}
 
-        # Track time if games are running
-        poll_interval = self.config["daemon"].get("poll_interval", 30)
-        if current_games:
-            state.gaming_time += poll_interval
-            state.total_time += poll_interval
+        # Send warnings if gaming (flags prevent duplicates)
+        if gaming_active and gaming_remaining > 0:
+            if gaming_remaining_mins <= 30 and not warned_30:
+                self.router.time_warning(user, 30, limits.get('gaming_limit', 120))
+                warned_30 = 1
 
-            # Refresh remaining time
-            total_remaining, gaming_remaining = self._get_remaining_time(user)
+            if gaming_remaining_mins <= 15 and not warned_15:
+                self.router.time_warning(user, 15, limits.get('gaming_limit', 120))
+                warned_15 = 1
 
-            # Send warnings
+            if gaming_remaining_mins <= 5 and not warned_5:
+                self.router.time_warning(user, 5, limits.get('gaming_limit', 120))
+                warned_5 = 1
+
+        # Enforce time limit
+        if gaming_active and gaming_remaining <= 0:
+            self.router.time_expired(user, limits.get('gaming_limit', 120))
+
+            # Grace period (in-line for now, could be state-based)
+            grace_seconds = self.daemon_config.get('strict_grace_seconds', 30)
+            self.router.grace_period(user, grace_seconds)
+            time.sleep(grace_seconds)
+
             for game in current_games:
-                self._send_warning_if_needed(user, gaming_remaining, game.name)
+                self._kill_process(game, user, notify=False)
+                self.router.enforcement(user, game.name)
 
-            # Enforce time limit
-            if gaming_remaining <= 0:
-                for game in current_games:
-                    notifier.send("⏰ Time's Up",
-                                 MessageTemplates.get("TIME_UP",
-                                                     app=game.name,
-                                                     total_remaining=format_duration(total_remaining)),
-                                 urgency="critical")
-                    time.sleep(30)  # Grace period
-                    self._kill_process(game, user)
+        # Update database state
+        self.db.update_daily_summary(user,
+                                      gaming_seconds=int(elapsed_seconds) if was_gaming_active else 0,
+                                      total_seconds=int(elapsed_seconds) if was_gaming_active else 0)
 
-        self._save_user_state(user)
+        self.db.update_user_state(user,
+                                   gaming_active=gaming_active,
+                                   gaming_time=gaming_used,
+                                   last_poll_at=now_iso,
+                                   warned_30=warned_30,
+                                   warned_15=warned_15,
+                                   warned_5=warned_5)
 
     def run(self):
         """Main daemon loop."""
@@ -1321,6 +1349,79 @@ def cmd_discover(args):
             print(f"  min_samples:          {config['min_samples']}")
 
 
+def cmd_message(args):
+    """Manage and test message templates."""
+    if args.action == "add":
+        require_root("message add")
+
+    try:
+        db = ActivityDB(args.db)
+    except Exception:
+        print(f"Error: Cannot access database at {args.db}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.action == "list":
+        templates = db.get_all_templates()
+        if not templates:
+            print("No templates found.")
+            return
+
+        # Group by intention
+        by_intention = {}
+        for t in templates:
+            intention = t['intention']
+            if intention not in by_intention:
+                by_intention[intention] = []
+            by_intention[intention].append(t)
+
+        print(Colors.header("Message Templates"))
+        print()
+
+        for intention in sorted(by_intention.keys()):
+            variants = by_intention[intention]
+            enabled_count = sum(1 for v in variants if v['enabled'])
+            print(f"{Colors.bold(intention)} ({enabled_count}/{len(variants)} enabled)")
+            for v in variants:
+                status = Colors.ok("●") if v['enabled'] else Colors.dim("○")
+                urgency = v['urgency']
+                urgency_color = Colors.RED if urgency == 'critical' else Colors.YELLOW if urgency == 'normal' else Colors.DIM
+                print(f"  {status} [{v['id']}] {v['title']}")
+                print(f"      {Colors.dim(v['body'][:60])}{'...' if len(v['body']) > 60 else ''}")
+            print()
+
+    elif args.action == "test":
+        # Send a test notification for the given intention
+        router = MessageRouter(db)
+        ctx = MessageContext(
+            user=args.user or "test_user",
+            process=args.process or "TestGame",
+            time_left=args.time_left or 30,
+            time_used=60,
+            time_limit=120,
+            grace_seconds=30,
+            mode="normal",
+        )
+        notification_id, backend = router.send(args.intention, ctx)
+        print(f"Sent '{args.intention}' notification via {backend} (id: {notification_id})")
+
+        # Show what was sent
+        recent = db.get_recent_messages(limit=1)
+        if recent:
+            msg = recent[0]
+            print(f"\n{Colors.bold('Title:')} {msg['rendered_title']}")
+            print(f"{Colors.bold('Body:')} {msg['rendered_body']}")
+
+    elif args.action == "add":
+        template_id = db.add_template(
+            intention=args.intention,
+            title=args.title,
+            body=args.body,
+            icon=args.icon or 'dialog-information',
+            urgency=args.urgency or 'normal',
+        )
+        print(f"Added template {template_id} for intention '{args.intention}'")
+
+
 def cmd_user(args):
     """Manage user limits."""
     if args.action in ("add", "disable", "enable"):
@@ -1482,6 +1583,25 @@ Examples:
     config_disc.add_argument("key", nargs="?", help="Config key to set")
     config_disc.add_argument("value", nargs="?", help="Value to set")
 
+    # Message management
+    message_parser = subparsers.add_parser("message", help="Manage message templates")
+    message_sub = message_parser.add_subparsers(dest="action")
+
+    message_sub.add_parser("list", help="List all message templates")
+
+    test_msg = message_sub.add_parser("test", help="Send a test notification")
+    test_msg.add_argument("intention", help="Message intention to test (e.g., process_start, time_warning_30)")
+    test_msg.add_argument("--user", help="Test user name (default: test_user)")
+    test_msg.add_argument("--process", help="Test process name (default: TestGame)")
+    test_msg.add_argument("--time-left", type=int, help="Test time left in minutes (default: 30)")
+
+    add_msg = message_sub.add_parser("add", help="Add a custom template")
+    add_msg.add_argument("intention", help="Message intention")
+    add_msg.add_argument("title", help="Notification title (supports {var} placeholders)")
+    add_msg.add_argument("body", help="Notification body (supports {var} placeholders)")
+    add_msg.add_argument("--icon", help="Icon name (default: dialog-information)")
+    add_msg.add_argument("--urgency", choices=["low", "normal", "critical"], help="Urgency level (default: normal)")
+
     # User management
     user_parser = subparsers.add_parser("user", help="Manage user limits")
     user_sub = user_parser.add_subparsers(dest="action")
@@ -1530,6 +1650,11 @@ Examples:
             cmd_user(args)
         else:
             user_parser.print_help()
+    elif args.command == "message":
+        if args.action:
+            cmd_message(args)
+        else:
+            message_parser.print_help()
     else:
         parser.print_help()
 
