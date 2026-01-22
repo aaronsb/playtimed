@@ -23,6 +23,7 @@ except ImportError:
 
 import os
 import pwd
+import subprocess
 
 
 def get_user_bus_address(username: str) -> Optional[str]:
@@ -92,6 +93,92 @@ class NotificationBackend(Protocol):
     def close(self, notification_id: int) -> bool:
         """Close/dismiss a notification by ID."""
         ...
+
+
+class NotifySendBackend:
+    """
+    Notification backend using notify-send subprocess.
+
+    Runs notify-send as the target user via runuser, bypassing D-Bus
+    security policies that prevent root from connecting to user sessions.
+    """
+
+    def __init__(self, username: str, app_name: str = "playtimed"):
+        self.username = username
+        self.app_name = app_name
+        self._uid = None
+        self._available = False
+
+        # Look up user and check if they have a session
+        try:
+            pw_entry = pwd.getpwnam(username)
+            self._uid = pw_entry.pw_uid
+            # Check if user has a running session (XDG_RUNTIME_DIR exists)
+            runtime_dir = f"/run/user/{self._uid}"
+            if os.path.isdir(runtime_dir):
+                self._available = True
+                log.debug(f"NotifySendBackend available for {username}")
+        except KeyError:
+            log.warning(f"User {username} not found")
+
+    @property
+    def name(self) -> str:
+        return f"notify-send@{self.username}"
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def send(
+        self,
+        title: str,
+        body: str,
+        urgency: int = URGENCY_NORMAL,
+        icon: str = "dialog-information",
+        replaces_id: int = 0,
+        timeout: int = -1,
+    ) -> int:
+        if not self._available:
+            return 0
+
+        urgency_str = {URGENCY_LOW: "low", URGENCY_NORMAL: "normal", URGENCY_CRITICAL: "critical"}
+
+        # Build notify-send command
+        cmd = [
+            "runuser", "-u", self.username, "--",
+            "notify-send",
+            "--app-name", self.app_name,
+            "--urgency", urgency_str.get(urgency, "normal"),
+            "--icon", icon,
+            title,
+            body,
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=5,
+                env={
+                    "XDG_RUNTIME_DIR": f"/run/user/{self._uid}",
+                    "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{self._uid}/bus",
+                }
+            )
+            if result.returncode == 0:
+                log.debug(f"Sent notification to {self.username}: {title}")
+                return 1  # notify-send doesn't return IDs, use 1 as success indicator
+            else:
+                log.warning(f"notify-send failed: {result.stderr.decode()}")
+                return 0
+        except subprocess.TimeoutExpired:
+            log.warning(f"notify-send timed out for {self.username}")
+            return 0
+        except Exception as e:
+            log.error(f"Failed to send notification to {self.username}: {e}")
+            return 0
+
+    def close(self, notification_id: int) -> bool:
+        # notify-send doesn't support closing notifications
+        return False
 
 
 class LogOnlyBackend:
@@ -349,11 +436,11 @@ class NotificationDispatcher:
             LogOnlyBackend(),
         ]
         self._last_backend: Optional[str] = None
-        # Cache of user-specific backends: username -> FreedesktopBackend
-        self._user_backends: dict[str, FreedesktopBackend] = {}
+        # Cache of user-specific backends: username -> NotifySendBackend
+        self._user_backends: dict[str, NotifySendBackend] = {}
 
-    def _get_user_backend(self, username: str) -> Optional[FreedesktopBackend]:
-        """Get or create a backend connected to a specific user's session bus."""
+    def _get_user_backend(self, username: str) -> Optional[NotifySendBackend]:
+        """Get or create a backend for sending notifications to a specific user."""
         if username in self._user_backends:
             backend = self._user_backends[username]
             if backend.is_available():
@@ -361,15 +448,11 @@ class NotificationDispatcher:
             # Backend became unavailable, remove from cache
             del self._user_backends[username]
 
-        # Try to connect to user's session bus
-        bus_address = get_user_bus_address(username)
-        if not bus_address:
-            return None
-
-        backend = FreedesktopBackend(self.app_name, bus_address=bus_address)
+        # Create notify-send backend for this user
+        backend = NotifySendBackend(username, self.app_name)
         if backend.is_available():
             self._user_backends[username] = backend
-            log.info(f"Connected to {username}'s session bus for notifications")
+            log.info(f"Created notify-send backend for {username}")
             return backend
 
         return None
