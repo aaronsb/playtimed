@@ -348,17 +348,86 @@ Handles persistent messaging:
 | `reset_hour` | `4` | Hour of day for reset (4am default) |
 | `warning_thresholds` | `30,15,5` | Minutes remaining for warnings |
 
+## Core Design Principles
+
+### Idempotent State Updates
+
+All state updates are idempotent - the daemon can crash, restart, or run multiple checks without corrupting data. State is derived from database, not held in memory.
+
+```
+Each poll cycle:
+1. Read current state from DB
+2. Observe current system (processes, time)
+3. Compute what state SHOULD be
+4. If different, transition and emit events
+5. Write new state to DB
+```
+
+This means:
+- No "missed" transitions due to timing
+- Daemon restart = seamless recovery
+- State is always consistent with reality
+
+### Wall-Clock Time Tracking (Not Cumulative)
+
+**Time used = wall-clock time when ANY tracked process is active.**
+
+```
+Example: 2-hour limit
+
+Timeline:
+  14:00  Anders starts Minecraft
+  14:30  Anders also starts Factorio (both running)
+  15:00  Anders closes Minecraft (Factorio still running)
+  15:30  Anders closes Factorio
+  16:00  Anders starts Minecraft again
+  16:30  Time limit reached
+
+Time used:
+  14:00-15:30 = 1.5 hours (doesn't matter that 2 games overlapped)
+  16:00-16:30 = 0.5 hours
+  Total: 2 hours ✓
+```
+
+This is tracked via:
+- `gaming_active` boolean flag in user state
+- When ANY tracked gaming process is running → clock ticks
+- When NO tracked gaming processes → clock stops
+- Multiple simultaneous games = still just one clock
+
+### Process-Independent Time
+
+We track time per USER, not per process:
+
+| What we track | How |
+|---------------|-----|
+| User's gaming time today | `daily_summary.gaming_time` |
+| User's total screen time | `daily_summary.total_time` |
+| Individual process sessions | `sessions` table (for analytics) |
+
+The `sessions` table records each process start/stop for historical analysis, but enforcement is based on user-level totals.
+
 ## Gaps and Edge Cases
 
 ### Where is user state stored?
 
-The user's current state (AVAILABLE, ENFORCING, etc.) needs to persist across daemon restarts. Options:
+The user's current state (AVAILABLE, ENFORCING, etc.) persists in the database for idempotent operation.
 
-1. **In-memory only** - Lost on restart, re-computed from daily_summary
-2. **In database** - New `user_state` table or column in `user_limits`
-3. **State file** - `/var/lib/playtimed/state.json`
+**Schema addition to `daily_summary`:**
 
-**Recommendation:** Store in `daily_summary` table as new column `state TEXT`. On startup, compute state from time_used vs limits.
+```sql
+ALTER TABLE daily_summary ADD COLUMN state TEXT DEFAULT 'available';
+ALTER TABLE daily_summary ADD COLUMN gaming_active INTEGER DEFAULT 0;
+ALTER TABLE daily_summary ADD COLUMN last_state_change TEXT;
+```
+
+On each poll:
+1. Load state from `daily_summary`
+2. Check current processes
+3. Update `gaming_active` (1 if any tracked gaming process running)
+4. If `gaming_active`, add poll_interval to `gaming_time`
+5. Compute correct state from time_used vs limits
+6. If state changed, emit event and update DB
 
 ### Warning deduplication
 
@@ -375,11 +444,28 @@ warnings_sent_5 INTEGER DEFAULT 0,
 
 What if Anders is running both Minecraft AND Factorio?
 
-- **Time tracking:** Already handled - total gaming time accumulates
-- **Process start message:** Send for each? Or just first?
-- **Enforcement:** Kill all tracked processes, not just one
+- **Time tracking:** Wall-clock based - both running = still one clock ticking
+- **Process start message:** Send for each new process, but mention total time not per-process
+- **Enforcement:** Kill ALL tracked processes when enforcing
 
-**Recommendation:** Send process_start only for first tracked process of the session. Track `active_processes` list in user state.
+**Implementation:**
+```python
+# Each poll cycle
+active_gaming_pids = get_active_tracked_processes(user, category='gaming')
+
+if active_gaming_pids and not user_state.gaming_active:
+    # Transition: not gaming → gaming
+    user_state.gaming_active = True
+    emit_event('gaming_session_start', first_process)
+
+elif not active_gaming_pids and user_state.gaming_active:
+    # Transition: gaming → not gaming
+    user_state.gaming_active = False
+    emit_event('gaming_session_end')
+
+if user_state.gaming_active:
+    user_state.gaming_time += poll_interval
+```
 
 ### Process end detection
 
@@ -418,12 +504,26 @@ When does the "day" reset?
 
 ### Daemon restart recovery
 
-On startup, daemon should:
-1. Load user limits
-2. Check current time vs allowed hours
-3. Calculate time_used from daily_summary
-4. Derive state from above
-5. Resume enforcement if needed
+Because state is in the database and updates are idempotent, restart is trivial:
+
+1. Load user state from `daily_summary` (includes `state`, `gaming_active`, `gaming_time`)
+2. Run normal poll cycle
+3. State machine naturally corrects if needed
+
+**Example:** Daemon crashes while Anders is gaming
+- `gaming_active = 1` in DB
+- Daemon restarts
+- Poll detects Minecraft still running
+- `gaming_active` stays 1, time continues accumulating
+- No duplicate "game started" message (state already reflected it)
+
+**Example:** Daemon crashes, Anders closes game before restart
+- `gaming_active = 1` in DB (stale)
+- Daemon restarts
+- Poll detects NO gaming processes
+- Transitions `gaming_active` to 0
+- Emits `gaming_session_end` event
+- Time stopped accumulating (correctly)
 
 ## Implementation Plan
 
