@@ -19,82 +19,144 @@ The daemon needs to communicate with users (Anders) in a consistent, friendly wa
 5. **Handle different behaviors** - Informational vs enforcement messages
 6. **Maintain testability** - Easy to verify messaging without full daemon
 
+## User Model
+
+**Single user per session.** The computer may have multiple monitored users (e.g., siblings), but only one is logged in at a time. The daemon tracks all configured users but only actively monitors whoever is currently logged in.
+
+This simplifies:
+- No need for multi-user notification routing
+- No concurrent time tracking conflicts
+- State is per-user in database, current user determined at runtime
+
 ## Architecture Overview
 
 ```mermaid
 flowchart TB
-    subgraph Daemon["Daemon Loop"]
-        direction TB
-    end
-
-    subgraph Detection["Event Detection"]
-        PM[Process Monitor]
-        TT[Time Tracker]
-        DS[Discovery Scanner]
+    subgraph Daemon["Daemon Poll Loop"]
+        SM[State Machine]
     end
 
     subgraph Router["Message Router"]
-        IM[Intention Mapper]
         TS[Template Selector]
         VR[Variable Renderer]
-        DQ[Delivery Queue]
     end
 
-    subgraph Notify["Notification Layer"]
-        NF[Notifier D-Bus]
+    subgraph Backends["Notification Backends (priority order)"]
+        CP[Clippy Backend]
+        KDE[KDE/Freedesktop Backend]
+        LOG[Log-Only Fallback]
     end
 
-    Daemon --> Detection
-    PM --> IM
-    TT --> IM
-    DS --> IM
-    IM --> TS
-    TS --> VR
-    VR --> DQ
-    DQ --> NF
+    SM -->|"event + context"| TS
+    TS -->|"template"| VR
+    VR -->|"rendered message"| CP
+    CP -->|"unavailable"| KDE
+    KDE -->|"unavailable"| LOG
 ```
 
 ## Component Purposes
 
-### Event Detection Layer
+### State Machine (in Daemon Loop)
 
-**What it does:** Monitors system state and recognizes when something noteworthy happens.
+**What it does:** Manages user state transitions and emits events.
 
-**Components:**
-- **Process Monitor** - Watches for tracked processes starting/stopping
-- **Time Tracker** - Tracks accumulated time, fires when thresholds crossed
-- **Discovery Scanner** - Identifies new high-CPU processes
+Lives in the existing poll loop (`_process_user`). On each cycle:
+1. Load user state from DB
+2. Observe current processes
+3. Compute what state SHOULD be
+4. If changed, emit event to router
+5. Write new state to DB
 
-**Output:** Events with context (e.g., "process_started" with process name, user, time remaining)
+**Events emitted:** `process_start`, `process_end`, `time_warning`, `time_expired`, `enforcement`, `discovery`, etc.
 
 ### Message Router
 
-**What it does:** Translates raw events into user-friendly notifications.
+**What it does:** Translates events into rendered notifications.
 
-**Responsibilities:**
-1. **Intention Mapping** - Determines what kind of message this event needs
-2. **Template Selection** - Picks a message variant (random or sequential)
-3. **Variable Rendering** - Fills in `{user}`, `{process}`, etc.
-4. **Delivery Management** - Handles rate limiting, deduplication
-5. **Logging** - Records what was sent for debugging/analytics
+**Simplified design** (no separate queue or intention mapper):
+1. **Template Selection** - Query DB for templates matching event type, pick variant
+2. **Variable Rendering** - Fill in `{user}`, `{process}`, `{time_left}`, etc.
+3. **Delivery** - Pass to notification backend chain
+4. **Logging** - Record what was sent
 
-**Why separate from detection?** The same event might need different messaging based on context. A process starting when time is almost up should mention the time constraint.
+Events map directly to intentions (1:1), so no separate mapper needed.
+Deduplication handled by state machine (warnings only fire once via flags).
 
-### Delivery Queue
+### Notification Backend Abstraction
 
-**What it does:** Manages the flow of notifications to prevent spam.
+**What it does:** Delivers notifications with graceful fallback.
 
-**Responsibilities:**
-1. **Rate Limiting** - Don't flood the user with notifications
-2. **Deduplication** - Same message within N seconds = skip
-3. **Priority Sorting** - Critical messages jump the queue
-4. **Replacement Logic** - Enforcement messages update existing notification
+```python
+class NotificationBackend(Protocol):
+    """Interface for notification delivery."""
 
-### Notifier (D-Bus)
+    def is_available(self) -> bool:
+        """Check if this backend can deliver notifications."""
+        ...
 
-**What it does:** Actually displays the notification on screen.
+    def send(self, title: str, body: str, urgency: str,
+             icon: str, replaces_id: int = 0) -> int:
+        """Send notification. Returns notification ID or 0 on failure."""
+        ...
 
-**Already implemented** in `notify.py`. Supports KDE Plasma and freedesktop-compliant servers.
+    def close(self, notification_id: int) -> bool:
+        """Close/dismiss a notification."""
+        ...
+```
+
+**Priority chain:**
+
+| Priority | Backend | D-Bus Service | Description |
+|----------|---------|---------------|-------------|
+| 1 | Clippy | `org.playtimed.Clippy` | Future: animated Clippy widget |
+| 2 | KDE/Freedesktop | `org.freedesktop.Notifications` | Standard desktop notifications |
+| 3 | Log-only | N/A | Just log, no visual notification |
+
+**Fallback logic:**
+```python
+class NotificationDispatcher:
+    def __init__(self):
+        self.backends = [
+            ClippyBackend(),      # Check first
+            FreedesktopBackend(), # Fallback
+            LogOnlyBackend(),     # Last resort
+        ]
+
+    def send(self, title: str, body: str, **kwargs) -> int:
+        for backend in self.backends:
+            if backend.is_available():
+                result = backend.send(title, body, **kwargs)
+                if result:
+                    return result
+        return 0  # All backends failed
+```
+
+This allows:
+- Future Clippy widget to take over seamlessly
+- Graceful degradation if no notification daemon
+- Easy testing (inject mock backend)
+
+### Error Handling
+
+**Template rendering failures:**
+```python
+def render(template: str, context: dict) -> str:
+    try:
+        return template.format(**context)
+    except KeyError as e:
+        log.warning(f"Missing template variable: {e}")
+        # Return template with unfilled vars rather than crash
+        return template
+```
+
+**Delivery failures:**
+- Backend chain handles unavailable backends automatically
+- If all backends fail, log the message (LogOnlyBackend always succeeds)
+- Message log records `backend='failed'` if no backend could deliver
+
+**Database failures:**
+- Template query fails → use hardcoded fallback message
+- Log write fails → continue (logging is nice-to-have, not critical)
 
 ## Data Flow Examples
 
@@ -195,23 +257,28 @@ Each notification has an **intention** - the semantic meaning of what we're comm
 
 ## Database Schema
 
-### message_templates
+### New Tables
+
+#### message_templates
 
 ```sql
 CREATE TABLE message_templates (
     id INTEGER PRIMARY KEY,
-    intention TEXT NOT NULL,        -- 'process_start', 'time_warning_15', etc.
+    intention TEXT NOT NULL,        -- 'process_start', 'time_warning', etc.
     variant INTEGER NOT NULL DEFAULT 0,  -- 0, 1, 2... for variety
     title TEXT NOT NULL,            -- Notification title (supports vars)
     body TEXT NOT NULL,             -- Notification body (supports vars)
     icon TEXT DEFAULT 'dialog-information',
     urgency TEXT DEFAULT 'normal',  -- 'low', 'normal', 'critical'
     enabled INTEGER DEFAULT 1,
+    created_at TEXT NOT NULL,
     UNIQUE(intention, variant)
 );
+
+CREATE INDEX idx_templates_intention ON message_templates(intention, enabled);
 ```
 
-### message_log
+#### message_log
 
 ```sql
 CREATE TABLE message_log (
@@ -223,8 +290,97 @@ CREATE TABLE message_log (
     rendered_title TEXT,
     rendered_body TEXT,
     notification_id INTEGER,        -- D-Bus notification ID
+    backend TEXT,                   -- 'clippy', 'freedesktop', 'log'
     FOREIGN KEY (template_id) REFERENCES message_templates(id)
 );
+
+CREATE INDEX idx_message_log_user_time ON message_log(user, timestamp);
+```
+
+### Schema Migration: daily_summary additions
+
+```sql
+-- Add state tracking columns to existing daily_summary table
+ALTER TABLE daily_summary ADD COLUMN state TEXT DEFAULT 'available';
+ALTER TABLE daily_summary ADD COLUMN gaming_active INTEGER DEFAULT 0;
+ALTER TABLE daily_summary ADD COLUMN gaming_started_at TEXT;
+ALTER TABLE daily_summary ADD COLUMN last_poll_at TEXT;
+ALTER TABLE daily_summary ADD COLUMN warned_30 INTEGER DEFAULT 0;
+ALTER TABLE daily_summary ADD COLUMN warned_15 INTEGER DEFAULT 0;
+ALTER TABLE daily_summary ADD COLUMN warned_5 INTEGER DEFAULT 0;
+```
+
+### Migration Function
+
+```python
+def migrate_message_router(db_path: str):
+    """Add message router tables and columns."""
+    with get_connection(db_path) as conn:
+        # Check if migration needed
+        cursor = conn.execute("PRAGMA table_info(daily_summary)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        if 'state' not in columns:
+            # Add state tracking to daily_summary
+            conn.executescript("""
+                ALTER TABLE daily_summary ADD COLUMN state TEXT DEFAULT 'available';
+                ALTER TABLE daily_summary ADD COLUMN gaming_active INTEGER DEFAULT 0;
+                ALTER TABLE daily_summary ADD COLUMN gaming_started_at TEXT;
+                ALTER TABLE daily_summary ADD COLUMN last_poll_at TEXT;
+                ALTER TABLE daily_summary ADD COLUMN warned_30 INTEGER DEFAULT 0;
+                ALTER TABLE daily_summary ADD COLUMN warned_15 INTEGER DEFAULT 0;
+                ALTER TABLE daily_summary ADD COLUMN warned_5 INTEGER DEFAULT 0;
+            """)
+
+        # Create message tables if not exist
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS message_templates (
+                id INTEGER PRIMARY KEY,
+                intention TEXT NOT NULL,
+                variant INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                icon TEXT DEFAULT 'dialog-information',
+                urgency TEXT DEFAULT 'normal',
+                enabled INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(intention, variant)
+            );
+
+            CREATE TABLE IF NOT EXISTS message_log (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                user TEXT NOT NULL,
+                intention TEXT NOT NULL,
+                template_id INTEGER,
+                rendered_title TEXT,
+                rendered_body TEXT,
+                notification_id INTEGER,
+                backend TEXT,
+                FOREIGN KEY (template_id) REFERENCES message_templates(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_templates_intention
+                ON message_templates(intention, enabled);
+            CREATE INDEX IF NOT EXISTS idx_message_log_user_time
+                ON message_log(user, timestamp);
+        """)
+
+        # Seed default templates if empty
+        count = conn.execute("SELECT COUNT(*) FROM message_templates").fetchone()[0]
+        if count == 0:
+            seed_default_templates(conn)
+```
+
+### Retention Policy
+
+Add to maintenance routine:
+
+```python
+def cleanup_message_log(conn, days: int = 7):
+    """Delete message_log entries older than N days."""
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    conn.execute("DELETE FROM message_log WHERE timestamp < ?", (cutoff,))
 ```
 
 ## Variable Substitution
@@ -270,44 +426,68 @@ body: "Launching {process}. You've got {time_left} minutes - I'll give you a hea
 
 Each monitored user has a state that determines what actions the daemon takes.
 
+**Note:** Warnings are events that fire during `AVAILABLE` state, not a separate state. This avoids the contradiction of being "in WARNING state" while also tracking which warnings have been sent.
+
 ```mermaid
 stateDiagram-v2
-    [*] --> DAY_RESET: midnight / manual
+    [*] --> AVAILABLE: daemon start / day reset
 
-    DAY_RESET --> AVAILABLE: counters cleared
-
-    AVAILABLE --> WARNING: time thresholds
-    WARNING --> AVAILABLE: still has time
-    WARNING --> EXPIRED: time_used >= limit
-
+    AVAILABLE --> AVAILABLE: time warnings (events, not state change)
     AVAILABLE --> OUTSIDE_HOURS: outside allowed window
+    AVAILABLE --> GRACE_PERIOD: time_used >= limit
+
     OUTSIDE_HOURS --> AVAILABLE: enters allowed window
+    OUTSIDE_HOURS --> AVAILABLE: new day
 
-    EXPIRED --> GRACE_PERIOD: warning sent
     GRACE_PERIOD --> ENFORCING: grace period elapsed
-    ENFORCING --> ENFORCING: process launches blocked
+    GRACE_PERIOD --> AVAILABLE: user closes all games (optional mercy)
 
-    ENFORCING --> DAY_RESET: new day
-    OUTSIDE_HOURS --> DAY_RESET: new day
+    ENFORCING --> ENFORCING: block new launches
+    ENFORCING --> AVAILABLE: new day
 
-    note right of DAY_RESET: Clear daily counters\nReset warning flags
-    note right of AVAILABLE: Normal operation\nTrack time, allow apps
-    note right of WARNING: Send warning notifications\n(30, 15, 5 min marks)
+    note right of AVAILABLE: Normal operation\nTrack time, send warnings
     note right of GRACE_PERIOD: 60s to save game\nCountdown notifications
     note right of ENFORCING: Kill tracked processes\nBlock new launches
+    note right of OUTSIDE_HOURS: Same as ENFORCING\nbut time-window based
 ```
 
-### State Descriptions
+### States
 
 | State | Purpose | Daemon Behavior |
 |-------|---------|-----------------|
-| `DAY_RESET` | Transition state at day boundary | Clears daily_summary, resets warning flags |
-| `AVAILABLE` | Normal operation | Tracks time, monitors processes, allows apps |
-| `WARNING` | User approaching limit | Same as AVAILABLE but sends warning messages |
-| `EXPIRED` | Time limit reached | Initiates grace period |
-| `GRACE_PERIOD` | Brief window to save/exit | Countdown notifications, no enforcement yet |
-| `ENFORCING` | Actively blocking | Terminates tracked processes, blocks launches |
-| `OUTSIDE_HOURS` | Outside allowed time window | Same enforcement as ENFORCING |
+| `AVAILABLE` | Normal operation | Tracks time, monitors processes, allows apps. Sends warning events at thresholds. |
+| `GRACE_PERIOD` | Brief window to save/exit | Countdown notifications. No kills yet. User can avoid enforcement by closing games. |
+| `ENFORCING` | Actively blocking | Terminates tracked processes, blocks new launches. |
+| `OUTSIDE_HOURS` | Outside allowed time window | Same as ENFORCING but triggered by clock, not usage. |
+
+### Warning Events (during AVAILABLE state)
+
+Warnings are **events**, not states. Tracked via flags to avoid repeating:
+
+```sql
+-- In daily_summary
+warned_30 INTEGER DEFAULT 0,  -- 1 if 30-min warning sent today
+warned_15 INTEGER DEFAULT 0,
+warned_5 INTEGER DEFAULT 0,
+```
+
+**Logic:**
+```python
+if state == AVAILABLE and gaming_active:
+    minutes_left = (limit - time_used) / 60
+
+    if minutes_left <= 30 and not warned_30:
+        emit_event('time_warning', minutes=30)
+        warned_30 = True
+
+    if minutes_left <= 15 and not warned_15:
+        emit_event('time_warning', minutes=15)
+        warned_15 = True
+
+    # etc.
+```
+
+Flags reset on day boundary along with time counters.
 
 ## Workers
 
@@ -655,30 +835,95 @@ Because state is in the database and updates are idempotent, restart is trivial:
 
 ## Implementation Plan
 
+### Phase 0: Refactor Existing Code
+- [ ] Extract `MessageTemplates` class from `main.py` into separate module
+- [ ] Create `NotificationBackend` protocol in `notify.py`
+- [ ] Wrap existing `Notifier` as `FreedesktopBackend`
+- [ ] Add `LogOnlyBackend` for fallback
+- [ ] Create `NotificationDispatcher` with backend chain
+
 ### Phase 1: Database & Templates
-- [ ] Add `message_templates` table
-- [ ] Add `message_log` table
-- [ ] Seed default templates
-- [ ] Create MessageTemplate model
+- [ ] Add migration function for new schema
+- [ ] Create `message_templates` and `message_log` tables
+- [ ] Seed default templates (3 variants per core intention)
+- [ ] Add `message_log` cleanup to maintenance routine
+- [ ] Add state columns to `daily_summary`
 
 ### Phase 2: Message Router
-- [ ] Create `router.py` module
-- [ ] Implement variable substitution
-- [ ] Implement template selection
-- [ ] Connect to notify.py
+- [ ] Create `router.py` module with `MessageRouter` class
+- [ ] Implement template selection (random variant)
+- [ ] Implement variable rendering with graceful fallback for missing vars
+- [ ] Connect router to `NotificationDispatcher`
+- [ ] Add delivery logging
 
-### Phase 3: Workers
-- [ ] Integrate router into daemon loop
-- [ ] Add ScheduleWorker for time events
-- [ ] Add EnforcementWorker for persistent messages
+### Phase 3: State Machine Integration
+- [ ] Add state tracking to `_process_user()` in daemon
+- [ ] Implement state transitions (AVAILABLE → GRACE_PERIOD → ENFORCING)
+- [ ] Add warning flags (warned_30, warned_15, warned_5)
+- [ ] Update timestamp-based time tracking
+- [ ] Handle suspend/resume (cap elapsed time)
 
-### Phase 4: State Machine
-- [ ] Implement user state tracking
-- [ ] Add state transitions
-- [ ] Handle edge cases (mode changes, config reload)
-
-### Phase 5: CLI & Testing
+### Phase 4: CLI & Testing
 - [ ] Add `playtimed message test <intention>` command
 - [ ] Add `playtimed message list` to show templates
-- [ ] Add `playtimed message add/edit` for customization
-- [ ] Write tests for router logic
+- [ ] Add `playtimed message add` for custom templates
+- [ ] Write tests for router logic (template selection, rendering)
+- [ ] Write tests for state machine transitions
+
+### Future: Clippy Backend
+- [ ] Create `ClippyBackend` class
+- [ ] Define D-Bus interface `org.playtimed.Clippy`
+- [ ] Add to dispatcher as priority 1
+- [ ] Build KDE Plasma widget (separate project)
+
+## Integration with Existing Code
+
+### Current: `notify.py`
+
+The existing `Notifier` class becomes `FreedesktopBackend`:
+
+```python
+# notify.py - refactored
+
+class FreedesktopBackend(NotificationBackend):
+    """Freedesktop.org notification backend (KDE, GNOME, etc.)."""
+
+    def __init__(self):
+        # Existing Notifier.__init__ code
+        ...
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def send(self, title, body, urgency='normal', icon='dialog-information',
+             replaces_id=0) -> int:
+        # Existing Notifier.notify() code
+        ...
+```
+
+### Current: `main.py` MessageTemplates
+
+The hardcoded `MessageTemplates` class moves to database. The existing convenience methods (`time_warning()`, `discovery_notice()`) become router calls:
+
+```python
+# Before (main.py)
+self.notifier.time_warning(minutes_left, user)
+
+# After
+self.router.send('time_warning', user=user, time_left=minutes_left)
+```
+
+### Current: Daemon loop
+
+The poll loop continues to exist but emits events to router instead of calling notifier directly:
+
+```python
+# Before
+if new_game_started:
+    self._send_notification(f"Started {game_name}...")
+
+# After
+if new_game_started:
+    self.router.send('process_start', user=user, process=game_name,
+                     time_left=minutes_left)
+```
