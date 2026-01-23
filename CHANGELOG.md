@@ -5,6 +5,26 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-01-23
+
+### Added
+- **Browser Worker Architecture**: Modular browser detection with Chrome history DB fallback
+  - `ChromeWorker` with signature matching and SQLite history lookup
+  - `FirefoxWorker` stub for future implementation
+  - Resolved domains even when window titles don't match known patterns
+- **`--name` Option for Promote**: `discover promote --name "Display Name"` sets friendly pattern names
+
+### Changed
+- Browser detection refactored from single module to `browser/` package
+- Domain resolution now falls back to Chrome history database when signatures fail
+
+## [0.2.2] - 2026-01-22
+
+### Added
+- **Browser Domain Tracking**: Detect websites in Chrome/Firefox via KWin D-Bus window titles
+- **Discovery for Browser Domains**: Unknown domains enter discovery queue like processes
+- **D-Bus Session Access**: Daemon connects to user session bus for browser detection
+
 ## [0.2.1] - 2026-01-22
 
 ### Fixed
