@@ -130,8 +130,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 ON process_patterns(monitor_state);
             CREATE INDEX IF NOT EXISTS idx_patterns_owner
                 ON process_patterns(owner);
-            CREATE INDEX IF NOT EXISTS idx_patterns_type
-                ON process_patterns(pattern_type);
+            -- NOTE: idx_patterns_type created in migrate_db after column is added
 
             -- Daemon configuration (mode, etc.)
             CREATE TABLE IF NOT EXISTS daemon_config (
