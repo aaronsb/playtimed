@@ -90,9 +90,13 @@ def get_windows_from_kwin(bus) -> list[tuple[str, str]]:
 
     Returns list of (window_id, title) tuples.
     """
+    dbus = _get_dbus()
+    if dbus is None:
+        return []
+
     try:
         kwin = bus.get_object('org.kde.KWin', '/WindowsRunner')
-        runner = bus.Interface(kwin, 'org.kde.krunner1')
+        runner = dbus.Interface(kwin, 'org.kde.krunner1')
 
         # Match('') returns all windows
         results = runner.Match('')
@@ -161,42 +165,91 @@ def get_browser_domains_for_user(uid: int) -> list[BrowserWindow]:
     """
     Get all browser windows for a user.
 
+    Uses subprocess to run D-Bus query as the user, since root cannot
+    directly access user session buses due to D-Bus security policy.
+
     Args:
         uid: User ID (e.g., 1000 for anders)
 
     Returns:
         List of BrowserWindow objects with detected domains.
     """
-    dbus = _get_dbus()
-    if dbus is None:
-        return []
+    import pwd
+    import subprocess
 
+    # Get username from UID
     try:
-        # Connect to user's session bus
-        bus_address = f'unix:path=/run/user/{uid}/bus'
-        os.environ['DBUS_SESSION_BUS_ADDRESS'] = bus_address
-        bus = dbus.SessionBus()
-
-        windows = get_windows_from_kwin(bus)
-
-        results = []
-        seen_domains = set()  # Deduplicate
-
-        for window_id, title in windows:
-            domain, browser = extract_domain_from_title(title)
-            if domain and domain not in seen_domains:
-                seen_domains.add(domain)
-                results.append(BrowserWindow(
-                    title=title,
-                    browser=browser,
-                    domain=domain,
-                ))
-
-        return results
-
-    except Exception as e:
-        log.debug("Failed to get browser domains for uid %d: %s", uid, e)
+        username = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        log.debug("No user found for uid %d", uid)
         return []
+
+    # Check if bus socket exists
+    bus_path = f'/run/user/{uid}/bus'
+    if not os.path.exists(bus_path):
+        log.debug("No session bus for uid %d", uid)
+        return []
+
+    # Query KWin via qdbus as the user (with session bus address set)
+    try:
+        env = os.environ.copy()
+        env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path=/run/user/{uid}/bus'
+
+        result = subprocess.run(
+            ['sudo', '-u', username, '--preserve-env=DBUS_SESSION_BUS_ADDRESS',
+             'qdbus6', '--literal', 'org.kde.KWin', '/WindowsRunner',
+             'org.kde.krunner1.Match', ''],
+            capture_output=True, text=True, timeout=5, env=env
+        )
+        if result.returncode != 0:
+            log.debug("qdbus6 failed: %s", result.stderr)
+            return []
+
+        # Parse qdbus literal output
+        windows = _parse_qdbus_output(result.stdout)
+
+    except subprocess.TimeoutExpired:
+        log.debug("qdbus6 timed out for uid %d", uid)
+        return []
+    except FileNotFoundError:
+        log.debug("qdbus6 not found")
+        return []
+    except Exception as e:
+        log.debug("Failed to query windows for uid %d: %s", uid, e)
+        return []
+
+    results = []
+    seen_domains = set()
+
+    for window_id, title in windows:
+        domain, browser = extract_domain_from_title(title)
+        if domain and domain not in seen_domains:
+            seen_domains.add(domain)
+            results.append(BrowserWindow(
+                title=title,
+                browser=browser,
+                domain=domain,
+            ))
+
+    return results
+
+
+def _parse_qdbus_output(output: str) -> list[tuple[str, str]]:
+    """Parse qdbus --literal output for window list."""
+    import re
+
+    windows = []
+    # Match pattern: "window_id", "title",
+    # The output has nested [Argument: ...] structures
+    # We want the second quoted string in each (sssida{sv}) tuple
+    pattern = r'\[Argument: \(sssida\{sv\}\) "([^"]*)", "([^"]*)"'
+
+    for match in re.finditer(pattern, output):
+        window_id = match.group(1)
+        title = match.group(2)
+        windows.append((window_id, title))
+
+    return windows
 
 
 def get_active_domains(uid: int) -> dict[str, str]:
