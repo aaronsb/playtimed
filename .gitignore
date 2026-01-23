@@ -39,9 +39,9 @@ htmlcov/
 # Project specific
 *.db
 
-# AUR/makepkg artifacts
-src/
-pkg/
+# AUR/makepkg build artifacts
+# Note: src/playtimed/ is our actual source code, must not be ignored
+/pkg/
 *.pkg.tar.zst
 *.pkg.tar.xz
 *.src.tar.gz

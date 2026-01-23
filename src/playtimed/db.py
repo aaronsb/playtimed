@@ -60,15 +60,18 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             -- Process patterns for detection and discovery
             -- monitor_state: 'active' (counting time), 'discovered' (found, needs review),
             --                'ignored' (don't care), 'disallowed' (terminate on sight)
+            -- pattern_type: 'process' (traditional), 'browser_domain' (website tracking)
             CREATE TABLE IF NOT EXISTS process_patterns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 pattern TEXT NOT NULL,
                 name TEXT NOT NULL,
-                category TEXT,  -- 'gaming', 'launcher', 'productive' (NULL for discovered)
+                category TEXT,  -- 'gaming', 'launcher', 'productive', 'educational' (NULL for discovered)
+                pattern_type TEXT NOT NULL DEFAULT 'process',  -- 'process' or 'browser_domain'
+                browser TEXT,  -- 'chrome', 'chromium', 'firefox' (NULL for processes)
                 monitor_state TEXT NOT NULL DEFAULT 'active',
                 owner TEXT,  -- user who owns this process (NULL = all users)
                 enabled INTEGER NOT NULL DEFAULT 1,
-                cpu_threshold REAL DEFAULT 5.0,  -- minimum CPU% to count as active
+                cpu_threshold REAL DEFAULT 5.0,  -- minimum CPU% to count as active (0 for browser domains)
 
                 -- Discovery metadata
                 discovered_cmdline TEXT,  -- original cmdline that led to discovery
@@ -127,6 +130,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 ON process_patterns(monitor_state);
             CREATE INDEX IF NOT EXISTS idx_patterns_owner
                 ON process_patterns(owner);
+            CREATE INDEX IF NOT EXISTS idx_patterns_type
+                ON process_patterns(pattern_type);
 
             -- Daemon configuration (mode, etc.)
             CREATE TABLE IF NOT EXISTS daemon_config (
@@ -312,6 +317,24 @@ def migrate_db(db_path: str = DEFAULT_DB_PATH) -> None:
         count = conn.execute("SELECT COUNT(*) FROM message_templates").fetchone()[0]
         if count == 0:
             _seed_default_templates(conn)
+
+        # Add browser visibility columns (ADR-001)
+        cursor = conn.execute("PRAGMA table_info(process_patterns)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        if 'pattern_type' not in columns:
+            conn.executescript("""
+                ALTER TABLE process_patterns ADD COLUMN pattern_type TEXT DEFAULT 'process';
+                ALTER TABLE process_patterns ADD COLUMN browser TEXT;
+
+                UPDATE process_patterns SET pattern_type = 'process' WHERE pattern_type IS NULL;
+            """)
+
+            # Add index for pattern_type queries
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_patterns_type
+                    ON process_patterns(pattern_type)
+            """)
 
 
 def _seed_default_templates(conn):
@@ -1167,6 +1190,92 @@ class ActivityDB:
         allowed = {'state', 'gaming_active', 'gaming_started_at', 'last_poll_at',
                    'warned_30', 'warned_15', 'warned_5', 'gaming_time', 'total_time'}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
+
+        if not updates:
+            return
+
+        with get_connection(self.db_path) as conn:
+            # Check if row exists
+            exists = conn.execute("""
+                SELECT 1 FROM daily_summary WHERE user = ? AND date = ?
+            """, (user, today)).fetchone()
+
+            if exists:
+                set_clause = ', '.join(f"{k} = ?" for k in updates.keys())
+                conn.execute(
+                    f"UPDATE daily_summary SET {set_clause} WHERE user = ? AND date = ?",
+                    (*updates.values(), user, today)
+                )
+            else:
+                # Insert new row with defaults
+                updates['date'] = today
+                updates['user'] = user
+                columns = ', '.join(updates.keys())
+                placeholders = ', '.join('?' * len(updates))
+                conn.execute(
+                    f"INSERT INTO daily_summary ({columns}) VALUES ({placeholders})",
+                    tuple(updates.values())
+                )
+
+    # --- Browser Patterns ---
+
+    def add_browser_pattern(self, domain: str, name: str, category: str,
+                            browser: str, owner: str = None,
+                            monitor_state: str = 'active') -> int:
+        """Add a browser domain pattern."""
+        now = datetime.now().isoformat()
+        with get_connection(self.db_path) as conn:
+            cursor = conn.execute("""
+                INSERT INTO process_patterns
+                    (pattern, name, category, pattern_type, browser,
+                     monitor_state, owner, cpu_threshold, created_at, updated_at)
+                VALUES (?, ?, ?, 'browser_domain', ?, ?, ?, 0, ?, ?)
+            """, (domain, name, category, browser, monitor_state, owner, now, now))
+            return cursor.lastrowid
+
+    def get_browser_patterns(self, owner: str = None,
+                             include_all_states: bool = False) -> list[dict]:
+        """Get browser domain patterns."""
+        with get_connection(self.db_path) as conn:
+            conditions = ["pattern_type = 'browser_domain'"]
+            params = []
+
+            if not include_all_states:
+                conditions.append("monitor_state = 'active'")
+
+            if owner:
+                conditions.append("(owner = ? OR owner IS NULL)")
+                params.append(owner)
+
+            where = " AND ".join(conditions)
+            rows = conn.execute(
+                f"SELECT * FROM process_patterns WHERE {where} ORDER BY name",
+                params
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_pattern_by_domain_and_owner(self, domain: str, owner: str) -> Optional[dict]:
+        """Find a browser pattern by domain and owner."""
+        with get_connection(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT * FROM process_patterns
+                WHERE pattern = ? AND pattern_type = 'browser_domain'
+                  AND (owner = ? OR owner IS NULL)
+            """, (domain, owner)).fetchone()
+            return dict(row) if row else None
+
+    def discover_browser_domain(self, domain: str, browser: str, owner: str) -> int:
+        """Create a discovered browser domain pattern."""
+        now = datetime.now().isoformat()
+        with get_connection(self.db_path) as conn:
+            cursor = conn.execute("""
+                INSERT INTO process_patterns
+                    (pattern, name, category, pattern_type, browser,
+                     monitor_state, owner, enabled, cpu_threshold,
+                     created_at, updated_at, last_seen)
+                VALUES (?, ?, NULL, 'browser_domain', ?, 'discovered', ?, 1, 0, ?, ?, ?)
+            """, (domain, domain, browser, owner, now, now, now))
+            return cursor.lastrowid
 
         if not updates:
             return

@@ -23,6 +23,7 @@ import yaml
 
 from .db import ActivityDB
 from .router import MessageRouter, MessageContext, get_router
+from .browser import BrowserMonitor
 
 # Default paths
 DEFAULT_CONFIG = "/etc/playtimed/config.yaml"
@@ -318,6 +319,9 @@ class ClaudeDaemon:
         # Strict mode pending kills: {pid: {'name': str, 'warned_at': time, 'user': str}}
         self.strict_pending: dict[int, dict] = {}
 
+        # Browser monitors per user: {user: BrowserMonitor}
+        self.browser_monitors: dict[str, BrowserMonitor] = {}
+
         # Our own PID (never kill ourselves!)
         self.our_pid = os.getpid()
 
@@ -469,6 +473,24 @@ class ClaudeDaemon:
             self.notifiers[user] = KDENotification(user)
         return self.notifiers[user]
 
+    def _get_user_uid(self, user: str) -> Optional[int]:
+        """Get UID for a username."""
+        import pwd
+        try:
+            return pwd.getpwnam(user).pw_uid
+        except KeyError:
+            log.warning(f"User {user} not found in passwd")
+            return None
+
+    def _get_browser_monitor(self, user: str) -> Optional[BrowserMonitor]:
+        """Get or create browser monitor for user."""
+        if user not in self.browser_monitors:
+            uid = self._get_user_uid(user)
+            if uid is None:
+                return None
+            self.browser_monitors[user] = BrowserMonitor(self.db, user, uid)
+        return self.browser_monitors[user]
+
     def _match_process_to_pattern(self, proc_name: str, cmdline: str,
                                      patterns: list[dict]) -> Optional[dict]:
         """Try to match a process against a list of patterns."""
@@ -601,6 +623,25 @@ class ClaudeDaemon:
         dead_pids = [pid for pid in self.strict_pending if pid not in seen_pids]
         for pid in dead_pids:
             del self.strict_pending[pid]
+
+        # Browser domain scanning
+        browser_monitor = self._get_browser_monitor(user)
+        if browser_monitor:
+            try:
+                browser_domains = browser_monitor.scan()
+                for domain, info in browser_domains.items():
+                    pattern = info.get('pattern')
+                    if pattern:
+                        # Track runtime for active browser domains
+                        state = pattern.get('monitor_state', 'discovered')
+                        if state == 'active':
+                            self.db.add_runtime(pattern['id'], poll_interval)
+
+                        # Notify about newly discovered domains
+                        if info.get('is_new'):
+                            self.router.discovery(user, domain)
+            except Exception as e:
+                log.debug(f"Browser scan failed for {user}: {e}")
 
     def _handle_strict_unknown(self, user: str, proc_name: str, cmdline: str,
                                 pid: int, cpu: float, grace_seconds: int):
@@ -1206,9 +1247,9 @@ def cmd_patterns(args):
             print("No patterns configured.")
             return
 
-        print(Colors.header("Process Patterns"))
+        print(Colors.header("Patterns"))
         print()
-        print(f"{Colors.bold('ID'):<12} {Colors.bold('State'):<20} {Colors.bold('Category'):<18} {Colors.bold('Owner'):<10} {Colors.bold('Name'):<18} {Colors.bold('Runs'):<8} {Colors.bold('Runtime'):<10}")
+        print(f"{Colors.bold('ID'):<6} {Colors.bold('Type'):<16} {Colors.bold('State'):<12} {Colors.bold('Category'):<12} {Colors.bold('Owner'):<10} {Colors.bold('Name'):<20} {Colors.bold('Runtime'):<10}")
         print(Colors.dim("─" * 95))
 
         state_colors = {
@@ -1222,14 +1263,21 @@ def cmd_patterns(args):
             state = p.get('monitor_state', 'active')
             category = p.get('category') or '-'
             owner = p.get('owner') or '*'
-            runs = p.get('unique_pid_count', 0)
             runtime = format_runtime(p.get('total_runtime_seconds', 0))
             enabled = "" if p['enabled'] else Colors.dim(" (off)")
+
+            # Format pattern type
+            pattern_type = p.get('pattern_type', 'process')
+            browser = p.get('browser')
+            if pattern_type == 'browser_domain' and browser:
+                type_str = f"browser:{browser}"
+            else:
+                type_str = pattern_type
 
             state_color = state_colors.get(state, '')
             state_str = f"{state_color}{state}{Colors.RESET}"
 
-            print(f"{p['id']:<4} {state_str:<20} {category:<10} {owner:<10} {p['name']:<18} {runs:<8} {runtime:<10}{enabled}")
+            print(f"{p['id']:<6} {type_str:<16} {state_str:<12} {category:<12} {owner:<10} {p['name']:<20} {runtime:<10}{enabled}")
 
         print()
         print(Colors.dim(f"Pattern details: playtimed patterns show <id>"))
@@ -1268,13 +1316,19 @@ def cmd_patterns(args):
             print(f"Set notes on pattern {args.id} ({pattern['name']})")
         else:
             # View pattern details including notes
+            pattern_type = pattern.get('pattern_type', 'process')
+            browser = pattern.get('browser')
+            type_str = f"browser:{browser}" if pattern_type == 'browser_domain' and browser else pattern_type
+
             print(f"{Colors.bold('Pattern')} #{pattern['id']}: {pattern['name']}")
+            print(f"  {Colors.dim('Type:')}     {type_str}")
             print(f"  {Colors.dim('Pattern:')}  {pattern['pattern']}")
             print(f"  {Colors.dim('State:')}    {pattern['monitor_state']}")
             print(f"  {Colors.dim('Category:')} {pattern.get('category') or '-'}")
             print(f"  {Colors.dim('Owner:')}    {pattern.get('owner') or '*'}")
-            print(f"  {Colors.dim('CPU:')}      {pattern['cpu_threshold']}%")
-            print(f"  {Colors.dim('Runs:')}     {pattern.get('unique_pid_count', 0)}")
+            if pattern_type == 'process':
+                print(f"  {Colors.dim('CPU:')}      {pattern['cpu_threshold']}%")
+                print(f"  {Colors.dim('Runs:')}     {pattern.get('unique_pid_count', 0)}")
             print(f"  {Colors.dim('Runtime:')}  {format_runtime(pattern.get('total_runtime_seconds', 0))}")
             if pattern.get('discovered_cmdline'):
                 print(f"  {Colors.dim('Cmdline:')}  {pattern['discovered_cmdline']}")
@@ -1303,26 +1357,35 @@ def cmd_discover(args):
         discovered = db.get_patterns_by_state('discovered')
         if not discovered:
             print(Colors.info("No discovered patterns awaiting review."))
-            print(f"\nRun the daemon to discover high-CPU processes automatically.")
+            print(f"\nRun the daemon to discover high-CPU processes and browser domains automatically.")
             return
 
-        print(Colors.header("👀 Discovered Processes") + " (awaiting review)")
+        print(Colors.header("👀 Discovered") + " (awaiting review)")
         print()
-        print(f"{Colors.bold('ID'):<12} {Colors.bold('Owner'):<10} {Colors.bold('Name'):<25} {Colors.bold('Runs'):<8} {Colors.bold('Runtime'):<10} {Colors.bold('Last Seen'):<20}")
-        print(Colors.dim("─" * 85))
+        print(f"{Colors.bold('ID'):<6} {Colors.bold('Type'):<16} {Colors.bold('Owner'):<10} {Colors.bold('Name'):<25} {Colors.bold('Runtime'):<10} {Colors.bold('Last Seen'):<20}")
+        print(Colors.dim("─" * 90))
 
         for p in discovered:
             owner = p.get('owner') or '*'
-            runs = p.get('unique_pid_count', 0)
             runtime = format_runtime(p.get('total_runtime_seconds', 0))
             last_seen = p.get('last_seen', '')[:16].replace('T', ' ') if p.get('last_seen') else '-'
-            print(f"{Colors.warn(p['id']):<12} {owner:<10} {Colors.bold(p['name']):<25} {runs:<8} {runtime:<10} {Colors.dim(last_seen):<20}")
+
+            # Format pattern type
+            pattern_type = p.get('pattern_type', 'process')
+            browser = p.get('browser')
+            if pattern_type == 'browser_domain' and browser:
+                type_str = f"browser:{browser}"
+            else:
+                type_str = pattern_type
+
+            print(f"{Colors.warn(p['id']):<6} {type_str:<16} {owner:<10} {Colors.bold(p['name']):<25} {runtime:<10} {Colors.dim(last_seen):<20}")
 
         print()
         print(Colors.dim("Actions:"))
-        print(f"  {Colors.ok('promote')} <id> gaming   - Monitor as a game")
-        print(f"  {Colors.dim('ignore')} <id>         - Ignore (not a game)")
-        print(f"  {Colors.error('disallow')} <id>      - Block (terminate on sight)")
+        print(f"  {Colors.ok('promote')} <id> gaming      - Monitor as gaming (counts against limit)")
+        print(f"  {Colors.ok('promote')} <id> educational - Track as educational (IXL, etc.)")
+        print(f"  {Colors.dim('ignore')} <id>            - Ignore (not tracked)")
+        print(f"  {Colors.error('disallow')} <id>         - Block (terminate on sight)")
 
     elif args.action == "promote":
         db.set_pattern_state(args.id, 'active', category=args.category)
@@ -1545,7 +1608,7 @@ Examples:
     add_pat = pattern_sub.add_parser("add", help="Add a pattern")
     add_pat.add_argument("pattern", help="Regex pattern")
     add_pat.add_argument("name", help="Display name")
-    add_pat.add_argument("category", choices=["gaming", "launcher", "productive"])
+    add_pat.add_argument("category", choices=["gaming", "launcher", "productive", "educational"])
     add_pat.add_argument("--cpu-threshold", type=float, help="Min CPU%% to count")
     add_pat.add_argument("--notes", help="Notes about this pattern")
 
@@ -1570,7 +1633,7 @@ Examples:
 
     promote_disc = discover_sub.add_parser("promote", help="Promote to active monitoring")
     promote_disc.add_argument("id", type=int, help="Pattern ID")
-    promote_disc.add_argument("category", choices=["gaming", "launcher", "productive"],
+    promote_disc.add_argument("category", choices=["gaming", "launcher", "productive", "educational"],
                               help="Category for monitoring")
 
     ignore_disc = discover_sub.add_parser("ignore", help="Mark as ignored")
