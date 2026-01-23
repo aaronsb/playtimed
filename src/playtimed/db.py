@@ -796,22 +796,26 @@ class ActivityDB:
                 """, (state,)).fetchall()
             return [dict(row) for row in rows]
 
-    def set_pattern_state(self, pattern_id: int, state: str, category: str = None):
+    def set_pattern_state(self, pattern_id: int, state: str,
+                          category: str = None, name: str = None):
         """Change a pattern's monitor state (promote, ignore, disallow)."""
         now = datetime.now().isoformat()
         with get_connection(self.db_path) as conn:
+            updates = ["monitor_state = ?", "updated_at = ?"]
+            params = [state, now]
+
             if category:
-                conn.execute("""
-                    UPDATE process_patterns
-                    SET monitor_state = ?, category = ?, updated_at = ?
-                    WHERE id = ?
-                """, (state, category, now, pattern_id))
-            else:
-                conn.execute("""
-                    UPDATE process_patterns
-                    SET monitor_state = ?, updated_at = ?
-                    WHERE id = ?
-                """, (state, now, pattern_id))
+                updates.append("category = ?")
+                params.append(category)
+            if name:
+                updates.append("name = ?")
+                params.append(name)
+
+            params.append(pattern_id)
+            conn.execute(
+                f"UPDATE process_patterns SET {', '.join(updates)} WHERE id = ?",
+                params
+            )
 
     def record_pid_seen(self, pattern_id: int, pid: int) -> bool:
         """Record that we've seen a PID for this pattern. Returns True if new."""

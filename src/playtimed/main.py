@@ -1388,8 +1388,12 @@ def cmd_discover(args):
         print(f"  {Colors.error('disallow')} <id>         - Block (terminate on sight)")
 
     elif args.action == "promote":
-        db.set_pattern_state(args.id, 'active', category=args.category)
-        print(f"Promoted pattern {args.id} to active monitoring (category: {args.category})")
+        name = getattr(args, 'name', None)
+        db.set_pattern_state(args.id, 'active', category=args.category, name=name)
+        msg = f"Promoted pattern {args.id} to active monitoring (category: {args.category})"
+        if name:
+            msg += f" as '{name}'"
+        print(msg)
 
     elif args.action == "ignore":
         db.set_pattern_state(args.id, 'ignored')
@@ -1635,6 +1639,7 @@ Examples:
     promote_disc.add_argument("id", type=int, help="Pattern ID")
     promote_disc.add_argument("category", choices=["gaming", "launcher", "productive", "educational"],
                               help="Category for monitoring")
+    promote_disc.add_argument("--name", help="Display name (e.g., 'YouTube' instead of 'youtube.com')")
 
     ignore_disc = discover_sub.add_parser("ignore", help="Mark as ignored")
     ignore_disc.add_argument("id", type=int, help="Pattern ID")
