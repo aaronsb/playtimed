@@ -632,10 +632,8 @@ class ClaudeDaemon:
                 for domain, info in browser_domains.items():
                     pattern = info.get('pattern')
                     if pattern:
-                        # Track runtime for active browser domains
-                        state = pattern.get('monitor_state', 'discovered')
-                        if state == 'active':
-                            self.db.add_runtime(pattern['id'], poll_interval)
+                        # Track runtime for all browser domains (like process patterns)
+                        self.db.add_runtime(pattern['id'], poll_interval)
 
                         # Notify about newly discovered domains
                         if info.get('is_new'):
