@@ -11,6 +11,7 @@ import pwd
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -310,3 +311,100 @@ class ChromeWorker(BrowserWorker):
                         pass
 
         return results
+
+    def get_active_urls_from_session(self, uid: int) -> list[str]:
+        """
+        Get currently active URLs from Chrome's session files.
+
+        Reads the SNSS session files directly, bypassing D-Bus entirely.
+        This works even when the daemon runs as root.
+
+        Args:
+            uid: User ID
+
+        Returns:
+            List of URLs currently open in Chrome
+        """
+        try:
+            home = Path(pwd.getpwuid(uid).pw_dir)
+        except KeyError:
+            return []
+
+        urls = []
+
+        for browser_id, profile_subpath in CHROME_PROFILE_PATHS.items():
+            sessions_dir = home / profile_subpath / 'Default' / 'Sessions'
+
+            if not sessions_dir.exists():
+                continue
+
+            # Find most recent Session file
+            session_files = sorted(
+                sessions_dir.glob('Session_*'),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+
+            if not session_files:
+                continue
+
+            latest_session = session_files[0]
+
+            try:
+                # Use strings to extract URLs from binary SNSS format
+                result = subprocess.run(
+                    ['strings', str(latest_session)],
+                    capture_output=True, text=True, timeout=5
+                )
+
+                if result.returncode == 0:
+                    # Extract HTTP(S) URLs
+                    url_pattern = re.compile(r'https?://[^\s"<>]+')
+                    found = url_pattern.findall(result.stdout)
+
+                    # Clean up URLs (remove trailing garbage)
+                    for url in found:
+                        # Strip common trailing characters that get captured
+                        clean_url = re.sub(r'[^\w/\-_.~:/?#\[\]@!$&\'()*+,;=%]+$', '', url)
+                        if clean_url and len(clean_url) > 10:
+                            urls.append(clean_url)
+
+                break  # Only use first available browser
+
+            except Exception as e:
+                log.debug("Failed to read session file: %s", e)
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique_urls = []
+        for url in urls:
+            if url not in seen:
+                seen.add(url)
+                unique_urls.append(url)
+
+        return unique_urls
+
+    def get_active_domains_from_session(self, uid: int) -> dict[str, str]:
+        """
+        Get currently active domains from Chrome's session files.
+
+        Args:
+            uid: User ID
+
+        Returns:
+            Dict mapping domain -> browser_id for active tabs
+        """
+        urls = self.get_active_urls_from_session(uid)
+        domains = {}
+
+        for url in urls:
+            try:
+                parsed = urlparse(url)
+                domain = parsed.netloc
+                if domain and not domain.startswith('chrome'):
+                    # Determine browser_id from profile path used
+                    domains[domain] = 'chrome'  # Could enhance to track actual browser
+            except Exception:
+                continue
+
+        return domains
