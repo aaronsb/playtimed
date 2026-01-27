@@ -27,7 +27,7 @@ install=playtimed.install
 source=(
     "$pkgname-$pkgver.tar.gz::https://github.com/aaronsb/playtimed/archive/v$pkgver.tar.gz"
 )
-sha256sums=('e0407f2197a3cb42bad273bdbe51421304aff66d0aeb7685524185885a9cecf1')
+sha256sums=('d987bf2100da066982faaacefdefe125090a4272aba349227e223ea6a03c6923')
 
 build() {
     cd "$srcdir/$pkgname-$pkgver"
