@@ -72,11 +72,10 @@ The header shows "LIVE" or "MOCK DATA" to indicate which mode is active.
 
 | Key | Action |
 |-----|--------|
-| `t` | Track selected app |
+| `t` | Track selected app as gaming |
 | `i` | Ignore selected app |
-| `b` | Block selected app |
-| `d` | Delete selected app |
-| `/` | Filter (stub) |
+| `b` | Block selected app (terminate on sight) |
+| `d` | Delete selected app from database |
 | `Tab` | Switch tabs (All/Discovered/Tracked/Ignored/Blocked) |
 
 ## Visual Feedback

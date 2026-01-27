@@ -307,6 +307,17 @@ class PlaytimedBackend:
         except Exception:
             return False
 
+    def delete_pattern(self, pattern_id: int) -> bool:
+        """Delete a pattern entirely"""
+        try:
+            result = subprocess.run(
+                ['playtimed', 'patterns', 'delete', str(pattern_id)],
+                capture_output=True, text=True
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     def set_user_limits(self, username: str, gaming_limit: int = None,
                         daily_total: int = None) -> bool:
         """Update user limits"""
@@ -405,6 +416,11 @@ class DataProvider:
         if self.use_mock:
             return True
         return self.backend.block_pattern(pattern_id)
+
+    def delete(self, pattern_id: int) -> bool:
+        if self.use_mock:
+            return True
+        return self.backend.delete_pattern(pattern_id)
 
     def set_limits(self, username: str, gaming: int = None, total: int = None) -> bool:
         if self.use_mock:
@@ -797,6 +813,7 @@ class AppsScreen(Screen):
         Binding("t", "track", "Track"),
         Binding("i", "ignore", "Ignore"),
         Binding("b", "block", "Block"),
+        Binding("d", "delete", "Delete"),
     ]
 
     selected_app: AppPattern | None = None
@@ -853,6 +870,7 @@ class AppsScreen(Screen):
             Button("Track", id="btn-track", variant="success"),
             Button("Ignore", id="btn-ignore"),
             Button("Block", id="btn-block", variant="error"),
+            Button("Delete", id="btn-delete", variant="warning"),
             classes="button-bar"
         )
         yield Footer()
@@ -870,6 +888,8 @@ class AppsScreen(Screen):
             self.action_ignore()
         elif event.button.id == "btn-block":
             self.action_block()
+        elif event.button.id == "btn-delete":
+            self.action_delete()
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -916,6 +936,16 @@ class AppsScreen(Screen):
                 self._refresh_screen()
             else:
                 self.notify(f"Failed to block {self.selected_app.name}", severity="error")
+        else:
+            self.notify("No app selected")
+
+    def action_delete(self) -> None:
+        if self.selected_app:
+            if DATA.delete(self.selected_app.id):
+                self.notify(f"Deleted {self.selected_app.name}")
+                self._refresh_screen()
+            else:
+                self.notify(f"Failed to delete {self.selected_app.name}", severity="error")
         else:
             self.notify("No app selected")
 
