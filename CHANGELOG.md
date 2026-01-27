@@ -5,6 +5,15 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-01-27
+
+### Fixed
+- **Browser Domain Runtime Tracking**: Discovered browser domains now accumulate runtime like process patterns
+  - Previously only "active" browser domains tracked time, making discovery review impossible
+  - Now all browser patterns (active, discovered, ignored) track runtime for evaluation
+- **Systemd Service Capabilities**: Added CAP_SETUID/CAP_SETGID for user notification delivery
+  - Fixes "runuser: cannot set groups" error when sending desktop notifications
+
 ## [0.2.3] - 2026-01-23
 
 ### Added

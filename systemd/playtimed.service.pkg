@@ -14,8 +14,8 @@ ProtectHome=read-only
 ReadWritePaths=/var/lib/playtimed
 PrivateTmp=true
 NoNewPrivileges=false
-# Needs to be able to kill user processes
-CapabilityBoundingSet=CAP_KILL CAP_SYS_PTRACE
+# Needs to be able to kill user processes and switch users for notifications
+CapabilityBoundingSet=CAP_KILL CAP_SYS_PTRACE CAP_SETUID CAP_SETGID
 
 [Install]
 WantedBy=multi-user.target
