@@ -624,28 +624,35 @@ class AppsPane(Container):
 
         yield Static(f"[bold]Apps for {self.user.username}[/bold]  [dim]Click to select[/dim]", classes="section-title")
 
+        # Pre-calculate counts for consistent tab labels
+        discovered = [a for a in user_apps if a.state == AppState.DISCOVERED]
+        tracked = [a for a in user_apps if a.state == AppState.TRACKED]
+        ignored = [a for a in user_apps if a.state == AppState.IGNORED]
+        blocked = [a for a in user_apps if a.state == AppState.BLOCKED]
+
+        # Fixed-width tab labels for consistency
+        def tab_label(name: str, count: int) -> str:
+            label = f"{name} ({count})"
+            return f"{label:<17}"
+
         with TabbedContent(id="apps-tabs"):
-            with TabPane("All", id="apps-tab-all"):
+            with TabPane(tab_label("All", len(user_apps)), id="apps-tab-all"):
                 yield ScrollableContainer(
                     *[AppRow(a, classes="app-row") for a in user_apps],
                 )
-            with TabPane(f"Discovered ({len([a for a in user_apps if a.state == AppState.DISCOVERED])})", id="apps-tab-discovered"):
-                discovered = [a for a in user_apps if a.state == AppState.DISCOVERED]
+            with TabPane(tab_label("Discovered", len(discovered)), id="apps-tab-discovered"):
                 yield ScrollableContainer(
                     *[AppRow(a, classes="app-row") for a in discovered],
                 )
-            with TabPane(f"Tracked ({len([a for a in user_apps if a.state == AppState.TRACKED])})", id="apps-tab-tracked"):
-                tracked = [a for a in user_apps if a.state == AppState.TRACKED]
+            with TabPane(tab_label("Tracked", len(tracked)), id="apps-tab-tracked"):
                 yield ScrollableContainer(
                     *[AppRow(a, classes="app-row") for a in tracked],
                 )
-            with TabPane("Ignored", id="apps-tab-ignored"):
-                ignored = [a for a in user_apps if a.state == AppState.IGNORED]
+            with TabPane(tab_label("Ignored", len(ignored)), id="apps-tab-ignored"):
                 yield ScrollableContainer(
                     *[AppRow(a, classes="app-row") for a in ignored],
                 )
-            with TabPane("Blocked", id="apps-tab-blocked"):
-                blocked = [a for a in user_apps if a.state == AppState.BLOCKED]
+            with TabPane(tab_label("Blocked", len(blocked)), id="apps-tab-blocked"):
                 yield ScrollableContainer(
                     *[AppRow(a, classes="app-row") for a in blocked],
                 )
@@ -839,28 +846,35 @@ class AppsScreen(Screen):
 
         yield Static(f"[bold]Apps for {self.user.username}[/bold]  [dim]Click to select, t/i/b for actions[/dim]", classes="screen-title")
 
+        # Pre-calculate counts for consistent tab labels
+        discovered = [a for a in user_apps if a.state == AppState.DISCOVERED]
+        tracked = [a for a in user_apps if a.state == AppState.TRACKED]
+        ignored = [a for a in user_apps if a.state == AppState.IGNORED]
+        blocked = [a for a in user_apps if a.state == AppState.BLOCKED]
+
+        # Fixed-width tab labels for consistency
+        def tab_label(name: str, count: int) -> str:
+            label = f"{name} ({count})"
+            return f"{label:<17}"
+
         with TabbedContent(id="apps-tabs"):
-            with TabPane("All", id="apps-tab-all"):
+            with TabPane(tab_label("All", len(user_apps)), id="apps-tab-all"):
                 yield ScrollableContainer(
                     *[AppRow(a, classes="app-row") for a in user_apps],
                 )
-            with TabPane(f"Discovered ({len([a for a in user_apps if a.state == AppState.DISCOVERED])})", id="apps-tab-discovered"):
-                discovered = [a for a in user_apps if a.state == AppState.DISCOVERED]
+            with TabPane(tab_label("Discovered", len(discovered)), id="apps-tab-discovered"):
                 yield ScrollableContainer(
                     *[AppRow(a, classes="app-row") for a in discovered],
                 )
-            with TabPane(f"Tracked ({len([a for a in user_apps if a.state == AppState.TRACKED])})", id="apps-tab-tracked"):
-                tracked = [a for a in user_apps if a.state == AppState.TRACKED]
+            with TabPane(tab_label("Tracked", len(tracked)), id="apps-tab-tracked"):
                 yield ScrollableContainer(
                     *[AppRow(a, classes="app-row") for a in tracked],
                 )
-            with TabPane("Ignored", id="apps-tab-ignored"):
-                ignored = [a for a in user_apps if a.state == AppState.IGNORED]
+            with TabPane(tab_label("Ignored", len(ignored)), id="apps-tab-ignored"):
                 yield ScrollableContainer(
                     *[AppRow(a, classes="app-row") for a in ignored],
                 )
-            with TabPane("Blocked", id="apps-tab-blocked"):
-                blocked = [a for a in user_apps if a.state == AppState.BLOCKED]
+            with TabPane(tab_label("Blocked", len(blocked)), id="apps-tab-blocked"):
                 yield ScrollableContainer(
                     *[AppRow(a, classes="app-row") for a in blocked],
                 )
@@ -1082,7 +1096,7 @@ class PlaytimedTUI(App):
     /* App rows */
     .app-row {
         padding: 0 1;
-        height: 2;
+        height: 1;
     }
 
     .app-row.hover {
