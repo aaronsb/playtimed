@@ -5,6 +5,11 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-02-07
+
+### Added
+- **Firefox Session File Reading** — Reads `recovery.jsonlz4` to get all open Firefox tabs including background tabs, matching Chrome's session file capability. Requires `python-lz4` (optional dependency)
+
 ## [0.3.2] - 2026-02-07
 
 ### Fixed

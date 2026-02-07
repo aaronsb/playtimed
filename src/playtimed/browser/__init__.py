@@ -103,14 +103,22 @@ def get_active_domains(uid: int) -> dict[str, str]:
     """
     domains = {}
 
-    # Chrome session files (doesn't require D-Bus, catches background tabs)
+    # Session file reading (catches background tabs without D-Bus)
     chrome_worker = ChromeWorker()
     session_domains = chrome_worker.get_active_domains_from_session(uid)
     if session_domains:
         log.debug("Got %d domains from Chrome session files", len(session_domains))
         domains.update(session_domains)
 
-    # Window title detection (catches Firefox + any browser with visible windows)
+    firefox_worker = FirefoxWorker()
+    ff_session = firefox_worker.get_active_domains_from_session(uid)
+    if ff_session:
+        log.debug("Got %d domains from Firefox session files", len(ff_session))
+        for domain, browser in ff_session.items():
+            if domain not in domains:
+                domains[domain] = browser
+
+    # Window title detection (fallback for browsers without session file support)
     windows = get_browser_domains_for_user(uid)
     for w in windows:
         if w.domain and w.domain not in domains:

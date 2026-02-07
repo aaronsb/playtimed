@@ -1,10 +1,14 @@
 """
 Firefox browser worker for playtimed.
 
-Uses places.sqlite for domain resolution from window titles.
+Uses places.sqlite for domain resolution from window titles,
+and recovery.jsonlz4 session files for active tab detection.
 
 Firefox stores history in:
     ~/.mozilla/firefox/<profile>/places.sqlite
+
+Session data in:
+    ~/.mozilla/firefox/<profile>/sessionstore-backups/recovery.jsonlz4
 
 Tables of interest:
     - moz_places: URLs and titles (has last_visit_date column)
@@ -13,6 +17,7 @@ Note: Firefox uses em-dash (—) not hyphen (-) in window titles:
     "Page Title — Mozilla Firefox"
 """
 
+import json
 import logging
 import pwd
 import re
@@ -29,12 +34,23 @@ from .base import BrowserWorker, BrowserTab
 
 log = logging.getLogger(__name__)
 
+# Try to import lz4 for session file reading
+try:
+    import lz4.block
+    HAS_LZ4 = True
+except ImportError:
+    HAS_LZ4 = False
+
+# Mozilla lz4 magic header
+MOZLZ4_MAGIC = b'mozLz40\x00'
+
 
 class FirefoxWorker(BrowserWorker):
     """
     Worker for Firefox browser.
 
-    Resolves domains via places.sqlite history lookup.
+    Resolves domains via places.sqlite history lookup and
+    session file reading for active tab detection.
     """
 
     @property
@@ -211,3 +227,70 @@ class FirefoxWorker(BrowserWorker):
                 best = profile
 
         return best
+
+    def get_active_urls_from_session(self, uid: int) -> list[str]:
+        """
+        Get currently active URLs from Firefox's session recovery file.
+
+        Reads recovery.jsonlz4 (Mozilla's custom lz4 format) to get
+        all open tab URLs, including background tabs.
+
+        Requires python-lz4. Returns empty list if not available.
+        """
+        if not HAS_LZ4:
+            return []
+
+        profile = self._find_firefox_profile(uid)
+        if not profile:
+            return []
+
+        recovery = profile / 'sessionstore-backups' / 'recovery.jsonlz4'
+        if not recovery.exists():
+            return []
+
+        try:
+            with open(recovery, 'rb') as f:
+                magic = f.read(8)
+                if magic != MOZLZ4_MAGIC:
+                    log.debug("Bad magic in recovery.jsonlz4: %s", magic)
+                    return []
+                compressed = f.read()
+
+            decompressed = lz4.block.decompress(compressed)
+            data = json.loads(decompressed)
+
+            urls = []
+            for window in data.get('windows', []):
+                for tab in window.get('tabs', []):
+                    entries = tab.get('entries', [])
+                    if entries:
+                        url = entries[-1].get('url', '')
+                        if url and url.startswith('http'):
+                            urls.append(url)
+
+            return urls
+
+        except Exception as e:
+            log.debug("Failed to read Firefox session: %s", e)
+            return []
+
+    def get_active_domains_from_session(self, uid: int) -> dict[str, str]:
+        """
+        Get currently active domains from Firefox's session file.
+
+        Returns:
+            Dict mapping domain -> 'firefox' for active tabs
+        """
+        urls = self.get_active_urls_from_session(uid)
+        domains = {}
+
+        for url in urls:
+            try:
+                parsed = urlparse(url)
+                domain = parsed.netloc
+                if domain:
+                    domains[domain] = 'firefox'
+            except Exception:
+                continue
+
+        return domains
