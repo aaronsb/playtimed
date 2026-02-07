@@ -5,6 +5,16 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-02-07
+
+### Added
+- **Firefox Domain Tracking** — Firefox browsing now resolves domains via places.sqlite history lookup, same as Chrome. Detects sites like discord.com that were previously invisible when accessed through Firefox
+- **ADR-002: Modular Worker Architecture** — Architecture decision record for decomposing the monolith into detection workers, enforcement kernel, communication workers, and reporting modules
+
+### Changed
+- **Browser Module Refactor** — Moved shared code (SITE_SIGNATURES, signature matching, title cleaning) from Chrome-specific into `BrowserWorker` base class. Both Chrome and Firefox workers now use the common interface
+- **`extract_domain_from_title()`** now iterates all registered workers instead of hardcoding Chrome
+
 ## [0.3.0] - 2026-02-07
 
 ### Added

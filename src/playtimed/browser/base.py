@@ -5,9 +5,40 @@ Each browser platform (Chrome, Firefox, etc.) implements BrowserWorker
 to provide platform-specific tab detection and domain resolution.
 """
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
+
+
+# Site signatures for fast-path domain resolution (skip DB lookup).
+# Shared across all browser workers. Checked longest-first to avoid partial matches.
+SITE_SIGNATURES = {
+    'Discord': 'discord.com',
+    'YouTube Music': 'music.youtube.com',
+    'YouTube': 'youtube.com',
+    'IXL': 'ixl.com',
+    'Google Search': 'google.com',
+    'Google Docs': 'docs.google.com',
+    'Google Sheets': 'docs.google.com',
+    'Google Slides': 'docs.google.com',
+    'Google Drive': 'drive.google.com',
+    'Google': 'google.com',
+    'Gmail': 'mail.google.com',
+    'Twitch': 'twitch.tv',
+    'Reddit': 'reddit.com',
+    'Twitter': 'twitter.com',
+    'GitHub': 'github.com',
+    'Netflix': 'netflix.com',
+    'Amazon': 'amazon.com',
+    'Wikipedia': 'wikipedia.org',
+    'Stack Overflow': 'stackoverflow.com',
+    'Coolmath Games': 'coolmathgames.com',
+    'Poki': 'poki.com',
+    'Roblox': 'roblox.com',
+    'ChatGPT': 'chatgpt.com',
+    'Claude': 'claude.ai',
+}
 
 
 @dataclass
@@ -149,3 +180,41 @@ class BrowserWorker(ABC):
             if title.endswith(suffix):
                 return title[:-len(suffix)]
         return title
+
+    def match_signature(self, title: str) -> Optional[str]:
+        """
+        Try to match a cleaned title against shared site signatures.
+
+        Checks longer signatures first to avoid partial matches.
+        Also checks pipe-separated format: "Page | Site Name".
+
+        Args:
+            title: Cleaned window title (browser suffix already removed)
+
+        Returns:
+            Domain string if matched, None otherwise
+        """
+        for sig, domain in sorted(SITE_SIGNATURES.items(), key=lambda x: -len(x[0])):
+            if sig in title:
+                return domain
+
+        if ' | ' in title:
+            parts = title.split(' | ')
+            site_name = parts[-1].strip()
+            if site_name in SITE_SIGNATURES:
+                return SITE_SIGNATURES[site_name]
+
+        return None
+
+    def clean_title(self, title: str) -> str:
+        """
+        Clean a window title: strip browser suffix and notification count.
+
+        Args:
+            title: Raw window title
+
+        Returns:
+            Cleaned title ready for signature matching or DB lookup
+        """
+        clean = self.strip_browser_suffix(title)
+        return re.sub(r'^\(\d+\)\s*', '', clean)

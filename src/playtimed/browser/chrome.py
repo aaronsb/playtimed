@@ -20,39 +20,9 @@ from urllib.parse import urlparse
 
 import psutil
 
-from .base import BrowserWorker, BrowserTab
+from .base import BrowserWorker, BrowserTab, SITE_SIGNATURES
 
 log = logging.getLogger(__name__)
-
-
-# Site signatures for fast-path domain resolution (skip DB lookup)
-# Checked in order - longer matches first to avoid partial matches
-SITE_SIGNATURES = {
-    'Discord': 'discord.com',
-    'YouTube Music': 'music.youtube.com',
-    'YouTube': 'youtube.com',
-    'IXL': 'ixl.com',
-    'Google Search': 'google.com',
-    'Google Docs': 'docs.google.com',
-    'Google Sheets': 'docs.google.com',
-    'Google Slides': 'docs.google.com',
-    'Google Drive': 'drive.google.com',
-    'Google': 'google.com',
-    'Gmail': 'mail.google.com',
-    'Twitch': 'twitch.tv',
-    'Reddit': 'reddit.com',
-    'Twitter': 'twitter.com',
-    'GitHub': 'github.com',
-    'Netflix': 'netflix.com',
-    'Amazon': 'amazon.com',
-    'Wikipedia': 'wikipedia.org',
-    'Stack Overflow': 'stackoverflow.com',
-    'Coolmath Games': 'coolmathgames.com',
-    'Poki': 'poki.com',
-    'Roblox': 'roblox.com',
-    'ChatGPT': 'chatgpt.com',
-    'Claude': 'claude.ai',
-}
 
 # Chrome profile paths by browser variant
 CHROME_PROFILE_PATHS = {
@@ -133,11 +103,10 @@ class ChromeWorker(BrowserWorker):
                 continue
 
             # Strip browser suffix and notification count
-            clean_title = self.strip_browser_suffix(title)
-            clean_title = re.sub(r'^\(\d+\)\s*', '', clean_title)
+            clean_title = self.clean_title(title)
 
             # Try signature matching first
-            domain = self._match_signature(clean_title)
+            domain = self.match_signature(clean_title)
 
             # Fallback to history DB lookup
             if domain is None:
@@ -185,26 +154,6 @@ class ChromeWorker(BrowserWorker):
                 log.debug("Resolved '%s' to '%s' via %s history",
                           title[:30], domain, browser_id)
                 return domain
-
-        return None
-
-    def _match_signature(self, title: str) -> Optional[str]:
-        """
-        Try to match title against known site signatures.
-
-        Checks longer signatures first to avoid partial matches.
-        """
-        # Sort by length descending
-        for sig, domain in sorted(SITE_SIGNATURES.items(), key=lambda x: -len(x[0])):
-            if sig in title:
-                return domain
-
-        # Check for pipe-separated site names (common format)
-        if ' | ' in title:
-            parts = title.split(' | ')
-            site_name = parts[-1].strip()
-            if site_name in SITE_SIGNATURES:
-                return SITE_SIGNATURES[site_name]
 
         return None
 

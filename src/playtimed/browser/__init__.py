@@ -6,9 +6,9 @@ and resolve window titles to domains.
 
 Architecture:
     - detection.py: KWin window title detection (shared)
-    - base.py: BrowserWorker ABC and BrowserTab dataclass
+    - base.py: BrowserWorker ABC, BrowserTab dataclass, SITE_SIGNATURES
     - chrome.py: ChromeWorker for Chrome/Chromium/Brave/Edge
-    - firefox.py: FirefoxWorker (stub for future)
+    - firefox.py: FirefoxWorker with places.sqlite domain resolution
 
 Public API:
     get_browser_domains_for_user(uid) -> list[BrowserWindow]
@@ -22,9 +22,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from .base import BrowserTab, BrowserWorker
+from .base import BrowserTab, BrowserWorker, SITE_SIGNATURES
 from .detection import get_window_titles
-from .chrome import ChromeWorker, SITE_SIGNATURES
+from .chrome import ChromeWorker
 from .firefox import FirefoxWorker
 
 log = logging.getLogger(__name__)
@@ -128,7 +128,7 @@ def extract_domain_from_title(title: str) -> tuple[Optional[str], Optional[str]]
     """
     Extract domain and browser from window title.
 
-    Legacy function - uses ChromeWorker internally.
+    Legacy function - tries each registered worker.
 
     Args:
         title: Window title
@@ -136,31 +136,25 @@ def extract_domain_from_title(title: str) -> tuple[Optional[str], Optional[str]]
     Returns:
         Tuple of (domain, browser)
     """
-    chrome_worker = ChromeWorker()
-
-    browser_id = chrome_worker.matches_window(title)
-    if browser_id is None:
-        # Try Firefox
-        firefox_worker = FirefoxWorker()
-        browser_id = firefox_worker.matches_window(title)
+    for worker in _WORKERS:
+        browser_id = worker.matches_window(title)
         if browser_id is None:
-            return None, None
+            continue
 
-    # Use Chrome worker for signature matching (works for any browser title)
-    clean_title = chrome_worker.strip_browser_suffix(title)
-    import re
-    clean_title = re.sub(r'^\(\d+\)\s*', '', clean_title)
+        clean_title = worker.clean_title(title)
+        domain = worker.match_signature(clean_title)
+        if domain:
+            return domain, browser_id
 
-    domain = chrome_worker._match_signature(clean_title)
-    if domain:
-        return domain, browser_id
+        # Unknown
+        import re
+        cleaned = re.sub(r'[^\w\s-]', '', clean_title)[:50].strip()
+        if cleaned:
+            return f'unknown:{cleaned}', browser_id
 
-    # Unknown
-    cleaned = re.sub(r'[^\w\s-]', '', clean_title)[:50].strip()
-    if cleaned:
-        return f'unknown:{cleaned}', browser_id
+        return None, browser_id
 
-    return None, browser_id
+    return None, None
 
 
 class BrowserMonitor:

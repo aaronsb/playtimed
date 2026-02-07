@@ -1,14 +1,13 @@
 """
 Firefox browser worker for playtimed.
 
-TODO: Implement full Firefox support using places.sqlite
+Uses places.sqlite for domain resolution from window titles.
 
 Firefox stores history in:
     ~/.mozilla/firefox/<profile>/places.sqlite
 
 Tables of interest:
-    - moz_places: URLs and titles
-    - moz_historyvisits: Visit timestamps
+    - moz_places: URLs and titles (has last_visit_date column)
 
 Note: Firefox uses em-dash (—) not hyphen (-) in window titles:
     "Page Title — Mozilla Firefox"
@@ -16,8 +15,13 @@ Note: Firefox uses em-dash (—) not hyphen (-) in window titles:
 
 import logging
 import pwd
+import re
+import shutil
+import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import psutil
 
@@ -30,8 +34,7 @@ class FirefoxWorker(BrowserWorker):
     """
     Worker for Firefox browser.
 
-    Currently a stub - returns empty results.
-    Full implementation would query places.sqlite for domain resolution.
+    Resolves domains via places.sqlite history lookup.
     """
 
     @property
@@ -46,8 +49,8 @@ class FirefoxWorker(BrowserWorker):
     def window_suffixes(self) -> dict[str, str]:
         # Note: Firefox uses em-dash (—) not hyphen (-)
         return {
-            ' — Mozilla Firefox': 'firefox',
-            ' — Firefox': 'firefox',
+            ' \u2014 Mozilla Firefox': 'firefox',
+            ' \u2014 Firefox': 'firefox',
             ' - Mozilla Firefox': 'firefox',  # Some versions use hyphen
             ' - Firefox': 'firefox',
         }
@@ -77,24 +80,35 @@ class FirefoxWorker(BrowserWorker):
         """
         Get active tabs from window titles.
 
-        TODO: Implement with places.sqlite lookup
-        Currently returns tabs with unknown domains.
+        For each Firefox window:
+        1. Try signature matching (fast path, shared with Chrome)
+        2. If unknown, try places.sqlite lookup (fallback)
         """
         tabs = []
+        seen_domains = set()
 
         for window_id, title in window_titles:
             browser_id = self.matches_window(title)
             if browser_id is None:
                 continue
 
-            clean_title = self.strip_browser_suffix(title)
+            # Strip browser suffix and notification count
+            clean_title = self.clean_title(title)
 
-            # TODO: Implement domain resolution via places.sqlite
-            # For now, mark as unknown
-            cleaned = clean_title[:50].strip()
-            domain = f'unknown:{cleaned}' if cleaned else None
+            # Try signature matching first
+            domain = self.match_signature(clean_title)
 
-            if domain:
+            # Fallback to places.sqlite lookup
+            if domain is None:
+                domain = self.resolve_domain(uid, clean_title)
+
+            # Still nothing? Mark as unknown
+            if domain is None:
+                cleaned = re.sub(r'[^\w\s-]', '', clean_title)[:50].strip()
+                domain = f'unknown:{cleaned}' if cleaned else None
+
+            if domain and domain not in seen_domains:
+                seen_domains.add(domain)
                 tabs.append(BrowserTab(
                     title=title,
                     domain=domain,
@@ -108,21 +122,69 @@ class FirefoxWorker(BrowserWorker):
         """
         Resolve title to domain via Firefox places.sqlite.
 
-        TODO: Implement using:
-            ~/.mozilla/firefox/<profile>/places.sqlite
-
-        Query would be:
-            SELECT url FROM moz_places WHERE title LIKE ?
-            ORDER BY last_visit_date DESC LIMIT 1
+        Copies the DB to a temp file first (Firefox locks it while running).
         """
-        # Stub - not implemented yet
-        return None
+        profile = self._find_firefox_profile(uid)
+        if not profile:
+            return None
+
+        places_path = profile / 'places.sqlite'
+        if not places_path.exists():
+            return None
+
+        domain = self._lookup_in_places(places_path, title)
+        if domain:
+            log.debug("Resolved '%s' to '%s' via Firefox places", title[:30], domain)
+        return domain
+
+    def _lookup_in_places(self, places_path: Path, title: str) -> Optional[str]:
+        """
+        Look up title in Firefox places.sqlite.
+
+        Copies the DB first to avoid lock issues with running Firefox.
+        """
+        temp_db = None
+        try:
+            # Copy to temp file (Firefox locks the original)
+            temp_db = Path(tempfile.mktemp(suffix='.db'))
+            shutil.copy2(places_path, temp_db)
+
+            conn = sqlite3.connect(temp_db)
+
+            # Search for matching title
+            cursor = conn.execute("""
+                SELECT url FROM moz_places
+                WHERE title LIKE ?
+                ORDER BY last_visit_date DESC
+                LIMIT 1
+            """, (f'%{title[:50]}%',))
+
+            row = cursor.fetchone()
+            conn.close()
+
+            if row:
+                parsed = urlparse(row[0])
+                return parsed.netloc
+
+            return None
+
+        except Exception as e:
+            log.debug("Firefox places lookup failed: %s", e)
+            return None
+
+        finally:
+            if temp_db and temp_db.exists():
+                try:
+                    temp_db.unlink()
+                except Exception:
+                    pass
 
     def _find_firefox_profile(self, uid: int) -> Optional[Path]:
         """
         Find the default Firefox profile directory.
 
         Firefox profiles are in ~/.mozilla/firefox/<random>.default-release/
+        Prefers profiles with 'default-release' in name, falls back to 'default'.
         """
         try:
             home = Path(pwd.getpwuid(uid).pw_dir)
@@ -133,11 +195,19 @@ class FirefoxWorker(BrowserWorker):
         if not firefox_dir.exists():
             return None
 
-        # Look for default-release profile
+        # Look for default-release profile first (preferred)
+        best = None
         for profile in firefox_dir.iterdir():
-            if profile.is_dir() and 'default' in profile.name.lower():
-                places = profile / 'places.sqlite'
-                if places.exists():
-                    return profile
+            if not profile.is_dir():
+                continue
+            places = profile / 'places.sqlite'
+            if not places.exists():
+                continue
 
-        return None
+            name_lower = profile.name.lower()
+            if 'default-release' in name_lower:
+                return profile  # Best match
+            elif 'default' in name_lower and best is None:
+                best = profile
+
+        return best
