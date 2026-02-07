@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 
 import psutil
 
-from .base import BrowserWorker, BrowserTab
+from .base import BrowserWorker, BrowserTab, is_excluded_domain
 
 log = logging.getLogger(__name__)
 
@@ -288,7 +288,7 @@ class FirefoxWorker(BrowserWorker):
             try:
                 parsed = urlparse(url)
                 domain = parsed.netloc
-                if domain:
+                if domain and not is_excluded_domain(domain):
                     domains[domain] = 'firefox'
             except Exception:
                 continue

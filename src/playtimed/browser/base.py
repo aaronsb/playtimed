@@ -40,6 +40,51 @@ SITE_SIGNATURES = {
     'Claude': 'claude.ai',
 }
 
+# Domain suffixes to exclude from tracking.
+# These are infrastructure/CDN domains, not user-navigated sites.
+# Matched by suffix so 'googlevideo.com' catches all subdomains.
+EXCLUDED_DOMAIN_SUFFIXES = {
+    'googlevideo.com',       # YouTube video CDN
+    'gstatic.com',           # Google static assets
+    'googleapis.com',        # Google API endpoints
+    'googleusercontent.com', # Google user content CDN
+    'google-analytics.com',  # Analytics
+    'doubleclick.net',       # Ads
+    'googlesyndication.com', # Ads
+    'gvt1.com',              # Google update servers
+    'gvt2.com',
+    'cloudfront.net',        # AWS CDN
+    'akamaihd.net',          # Akamai CDN
+    'fbcdn.net',             # Facebook CDN
+    'twimg.com',             # Twitter CDN
+}
+
+# Exact domains to exclude
+EXCLUDED_DOMAINS = {
+    'accounts.google.com',   # Auth flow, not a destination
+    'recaptcha.net',         # Bot detection
+    'www.recaptcha.net',
+    'clients1.google.com',   # Chrome internal
+    'clients2.google.com',
+}
+
+
+def is_excluded_domain(domain: str) -> bool:
+    """
+    Check if a domain should be excluded from tracking.
+
+    Filters out CDN, infrastructure, and auth domains that appear
+    in session files but aren't user-navigated destinations.
+    """
+    if not domain:
+        return True
+    if domain in EXCLUDED_DOMAINS:
+        return True
+    for suffix in EXCLUDED_DOMAIN_SUFFIXES:
+        if domain == suffix or domain.endswith('.' + suffix):
+            return True
+    return False
+
 
 @dataclass
 class BrowserTab:

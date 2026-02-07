@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from .base import BrowserTab, BrowserWorker, SITE_SIGNATURES
+from .base import BrowserTab, BrowserWorker, SITE_SIGNATURES, is_excluded_domain
 from .detection import get_window_titles
 from .chrome import ChromeWorker
 from .firefox import FirefoxWorker
@@ -292,4 +292,7 @@ __all__ = [
     # Constants
     'SITE_SIGNATURES',
     'BROWSER_SUFFIXES',
+
+    # Filtering
+    'is_excluded_domain',
 ]

@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 import psutil
 
-from .base import BrowserWorker, BrowserTab, SITE_SIGNATURES
+from .base import BrowserWorker, BrowserTab, SITE_SIGNATURES, is_excluded_domain
 
 log = logging.getLogger(__name__)
 
@@ -350,9 +350,8 @@ class ChromeWorker(BrowserWorker):
             try:
                 parsed = urlparse(url)
                 domain = parsed.netloc
-                if domain and not domain.startswith('chrome'):
-                    # Determine browser_id from profile path used
-                    domains[domain] = 'chrome'  # Could enhance to track actual browser
+                if domain and not domain.startswith('chrome') and not is_excluded_domain(domain):
+                    domains[domain] = 'chrome'
             except Exception:
                 continue
 
