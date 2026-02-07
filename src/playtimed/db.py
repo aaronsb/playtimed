@@ -6,7 +6,7 @@ Stores structured activity data for long-term metrics and analytics.
 
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -574,6 +574,44 @@ class ActivityDB:
             """, (user,)).fetchall()
             return [dict(row) for row in rows]
 
+    def get_history(self, user: str, days: int = 7) -> list[dict]:
+        """Get daily summaries for the last N days."""
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute("""
+                SELECT * FROM daily_summary
+                WHERE user = ?
+                ORDER BY date DESC
+                LIMIT ?
+            """, (user, days)).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_sessions_range(self, user: str, days: int = 1) -> list[dict]:
+        """Get sessions from the last N days."""
+        cutoff = (date.today() - timedelta(days=days - 1)).isoformat()
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute("""
+                SELECT * FROM sessions
+                WHERE user = ? AND date(start_time) >= ?
+                ORDER BY start_time DESC
+            """, (user, cutoff)).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_top_apps(self, user: str, days: int = 7, limit: int = 5) -> list[dict]:
+        """Get top apps by session count over last N days."""
+        cutoff = (date.today() - timedelta(days=days - 1)).isoformat()
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute("""
+                SELECT app,
+                       COUNT(*) as session_count,
+                       SUM(COALESCE(duration, 0)) as total_duration
+                FROM sessions
+                WHERE user = ? AND date(start_time) >= ?
+                GROUP BY app
+                ORDER BY session_count DESC
+                LIMIT ?
+            """, (user, cutoff, limit)).fetchall()
+            return [dict(row) for row in rows]
+
     def get_recent_events(self, user: str, limit: int = 50) -> list[dict]:
         """Get recent events for user."""
         with get_connection(self.db_path) as conn:
@@ -648,7 +686,10 @@ class ActivityDB:
                 params.append(owner)
 
             where = " AND ".join(conditions) if conditions else "1=1"
-            query = f"SELECT * FROM process_patterns WHERE {where} ORDER BY monitor_state, name"
+            # Order: user-specific patterns first, then global catchalls
+            query = f"""SELECT * FROM process_patterns WHERE {where}
+                        ORDER BY CASE WHEN owner IS NOT NULL THEN 0 ELSE 1 END,
+                                 monitor_state, name"""
 
             rows = conn.execute(query, params).fetchall()
             return [dict(row) for row in rows]
@@ -757,16 +798,17 @@ class ActivityDB:
         self.set_daemon_config('mode', mode)
 
     def discover_pattern(self, pattern: str, name: str, owner: str,
-                         cmdline: str = None, cpu_threshold: float = 5.0) -> int:
-        """Create a new discovered pattern (state='discovered')."""
+                         cmdline: str = None, cpu_threshold: float = 5.0,
+                         category: str = None, state: str = 'discovered') -> int:
+        """Create a new discovered pattern."""
         now = datetime.now().isoformat()
         with get_connection(self.db_path) as conn:
             cursor = conn.execute("""
                 INSERT INTO process_patterns
                     (pattern, name, category, monitor_state, owner, enabled,
                      cpu_threshold, discovered_cmdline, created_at, updated_at, last_seen)
-                VALUES (?, ?, NULL, 'discovered', ?, 1, ?, ?, ?, ?, ?)
-            """, (pattern, name, owner, cpu_threshold, cmdline, now, now, now))
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+            """, (pattern, name, category, state, owner, cpu_threshold, cmdline, now, now, now))
             return cursor.lastrowid
 
     def get_pattern_by_name_and_owner(self, name: str, owner: str) -> Optional[dict]:

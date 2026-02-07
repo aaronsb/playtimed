@@ -5,6 +5,18 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-02-07
+
+### Added
+- **CLI: `playtimed history`** — Daily screen time summaries with colored usage warnings
+- **CLI: `playtimed sessions`** — Individual game session details with start time, duration, and end reason
+- **CLI: `playtimed report`** — Week-at-a-glance with totals, averages, and top apps breakdown
+- **Proton Auto-Discovery** — Windows games via Proton/Wine are now individually identified instead of lumped as "Proton Game". Each .exe gets its own tracked pattern (e.g., "FalloutNV" instead of "Proton Game")
+
+### Fixed
+- **Session Duration Tracking** — Sessions now properly record end_time, duration, and end_reason. Previously `db.end_session()` was never called, leaving all sessions with NULL duration
+- **Pattern Matching Order** — User-specific patterns now match before global catchalls, so individually discovered games take priority over generic patterns
+
 ## [0.2.4] - 2026-01-27
 
 ### Fixed

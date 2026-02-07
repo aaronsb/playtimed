@@ -594,6 +594,14 @@ class ClaudeDaemon:
                     if cpu >= matched_pattern.get('cpu_threshold', 5.0):
                         self.db.add_runtime(pattern_id, poll_interval)
 
+                    # Auto-discover specific games from catchall patterns (.exe$)
+                    if (matched_pattern.get('owner') is None and
+                            matched_pattern.get('pattern') == r'\.exe$' and
+                            proc_name.lower().endswith('.exe')):
+                        self._discover_from_catchall(
+                            user, proc_name, cmdline, pid,
+                            matched_pattern)
+
                     # Handle disallowed processes (unless passthrough mode)
                     if state == 'disallowed' and self.mode != 'passthrough':
                         log.info(f"Killing disallowed process: {proc_name} (PID {pid})")
@@ -738,6 +746,41 @@ class ClaudeDaemon:
 
             # Clean up
             del self.discovery_candidates[key]
+
+    def _discover_from_catchall(self, user: str, proc_name: str, cmdline: str,
+                                pid: int, catchall_pattern: dict):
+        """Auto-discover a specific game from a catchall pattern like .exe$.
+
+        Similar to browser domain detection — the catchall is the "container"
+        and individual exe names are discovered within it.
+        """
+        # Check if we already have a specific pattern for this exe
+        existing = self.db.get_pattern_by_name_and_owner(proc_name, user)
+        if existing:
+            return
+
+        # Clean up display name: "FalloutNV.exe" -> "FalloutNV"
+        display_name = proc_name
+        if display_name.lower().endswith('.exe'):
+            display_name = display_name[:-4]
+
+        # Create a specific pattern that matches this exact exe
+        pattern_regex = re.escape(proc_name)
+        category = catchall_pattern.get('category', 'gaming')
+        cpu_threshold = catchall_pattern.get('cpu_threshold', 10.0)
+
+        pattern_id = self.db.discover_pattern(
+            pattern=pattern_regex,
+            name=display_name,
+            owner=user,
+            cmdline=cmdline[:200],
+            cpu_threshold=cpu_threshold,
+            category=category,
+            state='active',
+        )
+
+        self.db.record_pid_seen(pattern_id, pid)
+        log.info(f"Auto-discovered Proton game: {display_name} ({proc_name}) for {user}")
 
     def _is_allowed_time(self, user: str) -> tuple[bool, str]:
         """Check if current time is within allowed hours."""
@@ -959,6 +1002,15 @@ class ClaudeDaemon:
                 # Send notification via router
                 self.router.process_started(user, game.name, gaming_remaining_mins)
 
+        # Detect ended games and close their sessions
+        ended_pids = prev_pids - current_pids
+        for ended_pid in ended_pids:
+            ended_game = prev_games[ended_pid]
+            if ended_game.session_id:
+                self.db.end_session(session_id=ended_game.session_id, reason="natural")
+                log.info(f"Session ended (natural): {ended_game.name} (PID {ended_pid}) for {user}")
+            self.db.log_event(user, "game_end", app=ended_game.name, pid=ended_pid)
+
         # Update active games
         self.active_games[user] = {g.pid: g for g in current_games}
 
@@ -986,6 +1038,9 @@ class ClaudeDaemon:
             time.sleep(grace_seconds)
 
             for game in current_games:
+                if game.session_id:
+                    self.db.end_session(session_id=game.session_id, reason="enforced")
+                    log.info(f"Session ended (enforced): {game.name} (PID {game.pid}) for {user}")
                 self._kill_process(game, user, notify=False)
                 self.router.enforcement(user, game.name)
 
@@ -1210,6 +1265,184 @@ def cmd_maintenance(args):
     print(f"  Size: {result['after']['file_size_mb']:.2f} MB")
     print(f"  Events: {result['after']['events_count']}")
     print(f"  Sessions: {result['after']['sessions_count']}")
+
+
+def cmd_history(args):
+    """Show daily screen time history."""
+    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    try:
+        db = ActivityDB(db_path)
+    except Exception:
+        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    user = getattr(args, 'user', None)
+    days = getattr(args, 'days', 7) or 7
+
+    if user:
+        users = [user]
+    else:
+        users = db.get_all_monitored_users()
+        if not users:
+            print("No monitored users configured.")
+            return
+
+    for u in users:
+        summaries = db.get_history(u, days)
+        if not summaries:
+            print(f"No history for {u}")
+            continue
+
+        limits = db.get_user_limits(u) or {}
+        gaming_limit = limits.get('gaming_limit', 0)
+
+        print(Colors.header(f"Screen Time History: {u}") + f" (last {days} days)")
+        print()
+
+        headers = ["Date", "Day", "Gaming", "Total", "Sessions", "Warns", "Kills"]
+        rows = []
+        for s in summaries:
+            day_name = datetime.fromisoformat(s['date']).strftime("%a") if s.get('date') else ""
+            gaming_mins = s.get('gaming_time', 0) // 60
+            total_mins = s.get('total_time', 0) // 60
+
+            # Color gaming time red if over limit
+            gaming_str = format_duration(s.get('gaming_time', 0))
+            if gaming_limit and gaming_mins > gaming_limit:
+                gaming_str = Colors.error(gaming_str)
+            elif gaming_limit and gaming_mins > gaming_limit * 0.8:
+                gaming_str = Colors.warn(gaming_str)
+
+            rows.append([
+                s['date'],
+                day_name,
+                gaming_str,
+                format_duration(s.get('total_time', 0)),
+                str(s.get('session_count', 0)),
+                str(s.get('warnings_sent', 0)),
+                str(s.get('enforcements', 0)),
+            ])
+
+        print_table(headers, rows)
+        print()
+
+
+def cmd_sessions(args):
+    """Show individual game sessions."""
+    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    try:
+        db = ActivityDB(db_path)
+    except Exception:
+        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    user = args.user
+    if not user:
+        users = db.get_all_monitored_users()
+        user = users[0] if users else None
+    if not user:
+        print("No monitored users configured.")
+        return
+
+    day = getattr(args, 'date', None)
+    days = getattr(args, 'days', None)
+
+    if day:
+        sessions = db.get_sessions_for_day(user, day)
+        label = day
+    elif days:
+        sessions = db.get_sessions_range(user, days)
+        label = f"last {days} days"
+    else:
+        sessions = db.get_sessions_for_day(user)
+        label = "today"
+
+    if not sessions:
+        print(f"No sessions for {user} ({label})")
+        return
+
+    print(Colors.header(f"Sessions: {user}") + f" ({label})")
+    print()
+
+    headers = ["Date", "App", "Start", "Duration", "End"]
+    rows = []
+    for s in sessions:
+        start = s.get('start_time', '')
+        # Parse ISO timestamp to extract date and HH:MM
+        try:
+            st = datetime.fromisoformat(start)
+            start_time = st.strftime("%H:%M")
+            start_date = st.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            start_time = start
+            start_date = ""
+
+        duration = s.get('duration')
+        dur_str = format_duration(duration) if duration else Colors.dim("running")
+
+        reason = s.get('end_reason', '')
+        reason_map = {'natural': Colors.ok('exit'), 'enforced': Colors.error('killed'),
+                      'unknown': Colors.dim('?')}
+        reason_str = reason_map.get(reason, Colors.dim(reason or '-'))
+
+        rows.append([start_date, s.get('app', '?'), start_time, dur_str, reason_str])
+
+    print_table(headers, rows)
+    print()
+
+
+def cmd_report(args):
+    """Show weekly summary report."""
+    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    try:
+        db = ActivityDB(db_path)
+    except Exception:
+        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    user = getattr(args, 'user', None)
+    days = getattr(args, 'days', 7) or 7
+
+    if user:
+        users = [user]
+    else:
+        users = db.get_all_monitored_users()
+        if not users:
+            print("No monitored users configured.")
+            return
+
+    for u in users:
+        summaries = db.get_history(u, days)
+        top_apps = db.get_top_apps(u, days)
+
+        if not summaries:
+            print(f"No data for {u}")
+            continue
+
+        total_gaming = sum(s.get('gaming_time', 0) for s in summaries)
+        total_screen = sum(s.get('total_time', 0) for s in summaries)
+        total_sessions = sum(s.get('session_count', 0) for s in summaries)
+        total_enforcements = sum(s.get('enforcements', 0) for s in summaries)
+        active_days = len([s for s in summaries if s.get('gaming_time', 0) > 0])
+        avg_gaming = total_gaming // active_days if active_days else 0
+
+        print(Colors.header(f"Report: {u}") + f" (last {days} days)")
+        print()
+        print(f"  Total gaming:     {Colors.bold(format_duration(total_gaming))}")
+        print(f"  Total screen:     {format_duration(total_screen)}")
+        print(f"  Active days:      {active_days}/{len(summaries)}")
+        print(f"  Avg gaming/day:   {format_duration(avg_gaming)}")
+        print(f"  Sessions:         {total_sessions}")
+        if total_enforcements:
+            print(f"  Enforcements:     {Colors.error(str(total_enforcements))}")
+        print()
+
+        if top_apps:
+            print(f"  {Colors.bold('Top Apps:')}")
+            for app in top_apps:
+                dur = format_duration(app['total_duration']) if app['total_duration'] else '?'
+                print(f"    {app['app']:<25} {app['session_count']:>3} sessions  {dur:>10}")
+            print()
 
 
 def format_runtime(seconds: int) -> str:
@@ -1596,6 +1829,22 @@ Examples:
     maint_parser.add_argument("--sessions-days", type=int, default=90,
                               help="Keep sessions for this many days")
 
+    # History command
+    history_parser = subparsers.add_parser("history", help="Show daily screen time history")
+    history_parser.add_argument("user", nargs="?", help="User to check (default: all)")
+    history_parser.add_argument("--days", type=int, default=7, help="Number of days (default: 7)")
+
+    # Sessions command
+    sessions_parser = subparsers.add_parser("sessions", help="Show individual game sessions")
+    sessions_parser.add_argument("user", nargs="?", help="User to check")
+    sessions_parser.add_argument("--date", help="Specific date (YYYY-MM-DD)")
+    sessions_parser.add_argument("--days", type=int, help="Last N days")
+
+    # Report command
+    report_parser = subparsers.add_parser("report", help="Show weekly summary report")
+    report_parser.add_argument("user", nargs="?", help="User to check (default: all)")
+    report_parser.add_argument("--days", type=int, default=7, help="Number of days (default: 7)")
+
     # Mode command
     mode_parser = subparsers.add_parser("mode", help="View or set daemon mode")
     mode_parser.add_argument("set_mode", nargs="?", choices=["normal", "passthrough", "strict"],
@@ -1697,6 +1946,12 @@ Examples:
         daemon.run()
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "history":
+        cmd_history(args)
+    elif args.command == "sessions":
+        cmd_sessions(args)
+    elif args.command == "report":
+        cmd_report(args)
     elif args.command == "maintenance":
         cmd_maintenance(args)
     elif args.command == "mode":
