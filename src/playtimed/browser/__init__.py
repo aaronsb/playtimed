@@ -92,7 +92,8 @@ def get_active_domains(uid: int) -> dict[str, str]:
     Get currently active browser domains for a user.
 
     This is the main entry point for the daemon's scan loop.
-    Tries session file reading first (more reliable), falls back to window titles.
+    Combines Chrome session file reading with window title detection
+    so all browsers (Chrome, Firefox, etc.) are covered.
 
     Args:
         uid: User ID
@@ -100,17 +101,22 @@ def get_active_domains(uid: int) -> dict[str, str]:
     Returns:
         Dict mapping domain -> browser (e.g., {'discord.com': 'chrome'})
     """
-    # Try session file reading first (doesn't require D-Bus)
-    chrome_worker = ChromeWorker()
-    domains = chrome_worker.get_active_domains_from_session(uid)
-    if domains:
-        log.debug("Got %d domains from Chrome session files", len(domains))
-        return domains
+    domains = {}
 
-    # Fall back to window title detection
-    log.debug("Session file read failed, trying window titles")
+    # Chrome session files (doesn't require D-Bus, catches background tabs)
+    chrome_worker = ChromeWorker()
+    session_domains = chrome_worker.get_active_domains_from_session(uid)
+    if session_domains:
+        log.debug("Got %d domains from Chrome session files", len(session_domains))
+        domains.update(session_domains)
+
+    # Window title detection (catches Firefox + any browser with visible windows)
     windows = get_browser_domains_for_user(uid)
-    return {w.domain: w.browser for w in windows if w.domain}
+    for w in windows:
+        if w.domain and w.domain not in domains:
+            domains[w.domain] = w.browser
+
+    return domains
 
 
 # Legacy exports for backward compatibility
