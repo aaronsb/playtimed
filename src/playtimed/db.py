@@ -12,6 +12,27 @@ from typing import Optional
 
 DEFAULT_DB_PATH = "/var/lib/playtimed/playtimed.db"
 
+# Schedule constants
+DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+SCHEDULE_LEN = 168  # 7 days * 24 hours
+DEFAULT_SCHEDULE = '0' * SCHEDULE_LEN
+
+
+def schedule_from_ranges(wd_start: str, wd_end: str,
+                         we_start: str, we_end: str) -> str:
+    """Build a 168-char schedule string from start/end time ranges."""
+    wd_s = int(wd_start.split(':')[0]) if wd_start else 0
+    wd_e = int(wd_end.split(':')[0]) if wd_end else 24
+    we_s = int(we_start.split(':')[0]) if we_start else 0
+    we_e = int(we_end.split(':')[0]) if we_end else 24
+    bits = []
+    for day in range(7):
+        is_weekend = day >= 5
+        start, end = (we_s, we_e) if is_weekend else (wd_s, wd_e)
+        for hour in range(24):
+            bits.append('1' if start <= hour < end else '0')
+    return ''.join(bits)
+
 
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     """Initialize database schema."""
@@ -42,6 +63,17 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 warnings_sent INTEGER NOT NULL DEFAULT 0,
                 enforcements INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(date, user)
+            );
+
+            -- Hourly activity (one row per user per hour per day)
+            CREATE TABLE IF NOT EXISTS hourly_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                user TEXT NOT NULL,
+                gaming_seconds INTEGER NOT NULL DEFAULT 0,
+                total_seconds INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(date, hour, user)
             );
 
             -- Session tracking (start/end of each app session)
@@ -113,6 +145,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 weekday_end TEXT DEFAULT '21:00',
                 weekend_start TEXT DEFAULT '09:00',
                 weekend_end TEXT DEFAULT '22:00',
+                schedule TEXT,  -- 168-char string: 7 days * 24 hours, '1'=allowed '0'=blocked
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -122,6 +155,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 ON events(user, timestamp);
             CREATE INDEX IF NOT EXISTS idx_daily_user_date
                 ON daily_summary(user, date);
+            CREATE INDEX IF NOT EXISTS idx_hourly_user_date
+                ON hourly_activity(user, date);
             CREATE INDEX IF NOT EXISTS idx_sessions_user_date
                 ON sessions(user, start_time);
             CREATE INDEX IF NOT EXISTS idx_patterns_category
@@ -335,6 +370,34 @@ def migrate_db(db_path: str = DEFAULT_DB_PATH) -> None:
                     ON process_patterns(pattern_type)
             """)
 
+        # Add schedule column to user_limits if not present
+        cursor = conn.execute("PRAGMA table_info(user_limits)")
+        ul_columns = {row[1] for row in cursor.fetchall()}
+        if 'schedule' not in ul_columns:
+            conn.execute("ALTER TABLE user_limits ADD COLUMN schedule TEXT")
+            # Migrate existing time ranges to schedule strings
+            rows = conn.execute(
+                "SELECT user, weekday_start, weekday_end, weekend_start, weekend_end FROM user_limits"
+            ).fetchall()
+            for row in rows:
+                sched = schedule_from_ranges(row[1], row[2], row[3], row[4])
+                conn.execute("UPDATE user_limits SET schedule = ? WHERE user = ?", (sched, row[0]))
+
+        # Create hourly_activity table if not exists
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS hourly_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                user TEXT NOT NULL,
+                gaming_seconds INTEGER NOT NULL DEFAULT 0,
+                total_seconds INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(date, hour, user)
+            );
+            CREATE INDEX IF NOT EXISTS idx_hourly_user_date
+                ON hourly_activity(user, date);
+        """)
+
 
 def _seed_default_templates(conn):
     """Seed default message templates."""
@@ -424,6 +487,9 @@ def _seed_default_templates(conn):
          'dialog-information', 'low'),
         ('discovery', 1, 'Spotted something new',
          '{process} is new to me. If it is a game, it might get added to tracking.',
+         'dialog-information', 'low'),
+        ('discovery', 2, 'New app spotted',
+         'Detected {process}. Remember: do as I say, not as I sudo.',
          'dialog-information', 'low'),
 
         # day_reset - new day begins
@@ -536,6 +602,33 @@ class ActivityDB:
                     warnings_sent = warnings_sent + excluded.warnings_sent,
                     enforcements = enforcements + excluded.enforcements
             """, (today, user, gaming_seconds, total_seconds, warnings, enforcements))
+
+    def update_hourly_activity(self, user: str, gaming_seconds: int = 0,
+                               total_seconds: int = 0):
+        """Update or create hourly activity for user."""
+        today = date.today().isoformat()
+        hour = datetime.now().hour
+
+        with get_connection(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO hourly_activity (date, hour, user, gaming_seconds, total_seconds)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(date, hour, user) DO UPDATE SET
+                    gaming_seconds = gaming_seconds + excluded.gaming_seconds,
+                    total_seconds = total_seconds + excluded.total_seconds
+            """, (today, hour, user, gaming_seconds, total_seconds))
+
+    def get_hourly_activity(self, user: str, days: int = 7) -> list[dict]:
+        """Get hourly activity for user over the last N days."""
+        cutoff = (date.today() - timedelta(days=days - 1)).isoformat()
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute("""
+                SELECT date, hour, gaming_seconds, total_seconds
+                FROM hourly_activity
+                WHERE user = ? AND date >= ?
+                ORDER BY date, hour
+            """, (user, cutoff)).fetchall()
+            return [dict(row) for row in rows]
 
     def increment_session_count(self, user: str):
         """Increment session count for today."""
@@ -946,6 +1039,32 @@ class ActivityDB:
                     now, now
                 ))
                 return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_schedule(self, user: str) -> str:
+        """Get 168-char schedule string for user. Generates from time ranges if needed."""
+        limits = self.get_user_limits(user)
+        if not limits:
+            return DEFAULT_SCHEDULE
+        if limits.get('schedule'):
+            return limits['schedule']
+        # Generate from legacy time range columns
+        sched = schedule_from_ranges(
+            limits.get('weekday_start', '00:00'),
+            limits.get('weekday_end', '23:59'),
+            limits.get('weekend_start', '00:00'),
+            limits.get('weekend_end', '23:59'),
+        )
+        self.set_schedule(user, sched)
+        return sched
+
+    def set_schedule(self, user: str, schedule: str):
+        """Write a 168-char schedule string."""
+        now = datetime.now().isoformat()
+        with get_connection(self.db_path) as conn:
+            conn.execute(
+                "UPDATE user_limits SET schedule = ?, updated_at = ? WHERE user = ?",
+                (schedule, now, user)
+            )
 
     def get_all_monitored_users(self) -> list[str]:
         """Get list of all monitored users."""

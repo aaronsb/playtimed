@@ -140,6 +140,7 @@ class ProcessMatch:
     cmdline: str
     cpu_percent: float = 0.0
     session_id: Optional[int] = None  # DB session tracking
+    low_cpu_count: int = 0  # consecutive scans below CPU threshold (hysteresis)
 
 
 class NotificationBackend:
@@ -505,8 +506,14 @@ class ClaudeDaemon:
         return None
 
     def _find_gaming_processes(self, user: str) -> list[ProcessMatch]:
-        """Find running processes matching active gaming patterns."""
+        """Find running processes matching active gaming patterns.
+
+        Uses hysteresis: CPU threshold gates initial detection, but once a
+        game PID is tracked it stays active until the process actually exits.
+        This prevents flickering when games idle briefly between CPU bursts.
+        """
         matches = []
+        prev_games = self.active_games.get(user, {})
 
         # Get active patterns from database
         launcher_patterns = self.db.get_patterns(category="launcher", owner=user)
@@ -527,24 +534,44 @@ class ClaudeDaemon:
                 # Check gaming patterns
                 pdef = self._match_process_to_pattern(proc_name, cmdline, gaming_patterns)
                 if pdef:
-                    cpu_threshold = pdef.get("cpu_threshold", 5.0)
+                    pid = proc.info['pid']
+                    already_tracked = pid in prev_games
 
                     try:
                         cpu = proc.cpu_percent(interval=0.1)
                     except psutil.NoSuchProcess:
                         continue
 
-                    if cpu >= cpu_threshold:
-                        matches.append(ProcessMatch(
-                            pid=proc.info['pid'],
+                    cpu_threshold = pdef.get("cpu_threshold", 5.0)
+                    above_threshold = cpu >= cpu_threshold
+
+                    # Hysteresis: once tracked, stay tracked for a cooldown
+                    # period (3 scans ~90s) to prevent flicker exploits
+                    if above_threshold or already_tracked:
+                        match = ProcessMatch(
+                            pid=pid,
                             name=pdef.get("name", proc_name),
                             category="gaming",
                             cmdline=cmdline[:100],
                             cpu_percent=cpu
-                        ))
+                        )
+                        # Preserve session_id from previous tracking
+                        if already_tracked:
+                            prev = prev_games[pid]
+                            if prev.session_id:
+                                match.session_id = prev.session_id
+                            # Track consecutive low-CPU scans
+                            if above_threshold:
+                                match.low_cpu_count = 0
+                            else:
+                                match.low_cpu_count = prev.low_cpu_count + 1
+                                if match.low_cpu_count >= 3:
+                                    # Cooldown expired — drop this PID
+                                    continue
+                        matches.append(match)
 
                         # Track stats for this pattern
-                        self.db.record_pid_seen(pdef['id'], proc.info['pid'])
+                        self.db.record_pid_seen(pdef['id'], pid)
 
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
@@ -783,28 +810,15 @@ class ClaudeDaemon:
         log.info(f"Auto-discovered Proton game: {display_name} ({proc_name}) for {user}")
 
     def _is_allowed_time(self, user: str) -> tuple[bool, str]:
-        """Check if current time is within allowed hours."""
-        user_config = self.config.get("users", {}).get(user, {})
-        schedule = user_config.get("schedule", {})
-
-        if not schedule:
-            return True, ""
-
+        """Check if current time is within allowed hours (from schedule)."""
+        schedule = self.db.get_schedule(user)
         now = datetime.now()
-        day_type = "weekend" if now.weekday() >= 5 else "weekday"
-        day_schedule = schedule.get(day_type, {})
+        idx = (now.weekday() * 24) + now.hour
 
-        start = day_schedule.get("allowed_start", "00:00")
-        end = day_schedule.get("allowed_end", "23:59")
-
-        start_time = datetime.strptime(start, "%H:%M").time()
-        end_time = datetime.strptime(end, "%H:%M").time()
-        current_time = now.time()
-
-        if start_time <= current_time <= end_time:
+        if schedule[idx] == '1':
             return True, ""
 
-        return False, f"Gaming is only allowed between {start} and {end}"
+        return False, f"Gaming is not allowed at this time ({now.strftime('%a %H:00')})"
 
     def _get_remaining_time(self, user: str) -> tuple[int, int]:
         """Get remaining total and gaming time in seconds."""
@@ -1048,6 +1062,9 @@ class ClaudeDaemon:
         self.db.update_daily_summary(user,
                                       gaming_seconds=int(elapsed_seconds) if was_gaming_active else 0,
                                       total_seconds=int(elapsed_seconds) if was_gaming_active else 0)
+        self.db.update_hourly_activity(user,
+                                        gaming_seconds=int(elapsed_seconds) if was_gaming_active else 0,
+                                        total_seconds=int(elapsed_seconds) if was_gaming_active else 0)
 
         self.db.update_user_state(user,
                                    gaming_active=gaming_active,
@@ -1443,6 +1460,501 @@ def cmd_report(args):
                 dur = format_duration(app['total_duration']) if app['total_duration'] else '?'
                 print(f"    {app['app']:<25} {app['session_count']:>3} sessions  {dur:>10}")
             print()
+
+
+def cmd_heatmap(args):
+    """Show activity heatmap by day and hour."""
+    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    try:
+        db = ActivityDB(db_path)
+    except Exception:
+        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    user = getattr(args, 'user', None)
+    days = getattr(args, 'days', 7) or 7
+
+    if user:
+        users = [user]
+    else:
+        users = db.get_all_monitored_users()
+        if not users:
+            print("No monitored users configured.")
+            return
+
+    # Intensity blocks and colors
+    def heat_cell(minutes):
+        if minutes == 0:
+            return Colors.dim(" · ")
+        elif minutes <= 15:
+            return Colors.GREEN + "░░░" + Colors.RESET
+        elif minutes <= 30:
+            return Colors.YELLOW + "▒▒▒" + Colors.RESET
+        elif minutes <= 45:
+            return Colors.RED + "▓▓▓" + Colors.RESET
+        else:
+            return Colors.RED + Colors.BOLD + "███" + Colors.RESET
+
+    for u in users:
+        hourly = db.get_hourly_activity(u, days)
+        if not hourly:
+            print(f"No hourly data for {u} (data starts collecting after upgrade)")
+            continue
+
+        # Build grid: {date_str: {hour: gaming_seconds}}
+        grid = {}
+        for row in hourly:
+            d = row['date']
+            if d not in grid:
+                grid[d] = {}
+            grid[d][row['hour']] = row['gaming_seconds']
+
+        # Sort dates
+        sorted_dates = sorted(grid.keys())
+        day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+        print(Colors.header(f"Heatmap: {u}") + f" (last {days} days)")
+        print()
+
+        # Header row
+        header = "       "
+        for h in range(24):
+            header += f"{h:02d}  "
+        print(Colors.dim(header))
+
+        # Top border
+        print("       ┌" + "───┬" * 23 + "───┐")
+
+        # Data rows
+        for i, d in enumerate(sorted_dates):
+            dt = date.fromisoformat(d)
+            day_label = day_names[dt.weekday()]
+            row_str = f"  {day_label}  │"
+            for h in range(24):
+                secs = grid[d].get(h, 0)
+                mins = secs // 60
+                row_str += heat_cell(mins) + "│"
+            print(row_str)
+
+            if i < len(sorted_dates) - 1:
+                print("       ├" + "───┼" * 23 + "───┤")
+            else:
+                print("       └" + "───┴" * 23 + "───┘")
+
+        print()
+        print(f"  {Colors.dim(' · ')} 0m  "
+              f"{Colors.GREEN}░░░{Colors.RESET} 1-15m  "
+              f"{Colors.YELLOW}▒▒▒{Colors.RESET} 16-30m  "
+              f"{Colors.RED}▓▓▓{Colors.RESET} 31-45m  "
+              f"{Colors.RED}{Colors.BOLD}███{Colors.RESET} 46-60m")
+        print()
+
+
+def cmd_schedule(args):
+    """Show schedule grid for a user."""
+    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    try:
+        db = ActivityDB(db_path)
+    except Exception:
+        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    user = getattr(args, 'user', None)
+    if user:
+        users = [user]
+    else:
+        users = db.get_all_monitored_users()
+        if not users:
+            print("No monitored users configured.")
+            return
+
+    for i, u in enumerate(users):
+        limits = db.get_user_limits(u)
+        if not limits:
+            print(f"No limits configured for {u}")
+            continue
+
+        if i > 0:
+            print()
+
+        schedule = db.get_schedule(u)
+
+        print(Colors.header(f"━━━ {u} ━━━"))
+        print(f"  Gaming limit: {Colors.bold(str(limits['gaming_limit']))} min/day")
+        print()
+
+        _print_schedule_grid(schedule)
+
+
+def _print_schedule_grid(schedule: str):
+    """Print a 7×24 schedule grid with CP437 box-drawing characters.
+
+    Renders the schedule as a bordered grid with shade characters:
+
+        ┌───┬───┬───┬─── ... ───┐
+    Mon │░░░│░░░│▓▓▓│▓▓▓ ... ░░░│
+        ├───┼───┼───┼─── ... ───┤
+    Tue │░░░│░░░│▓▓▓│▓▓▓ ... ░░░│
+        ...
+        ╞═══╪═══╪═══╪═══ ... ═══╡   <- weekday/weekend transition
+    Sat ║░░░║▓▓▓║▓▓▓║▓▓▓ ... ░░░║
+        ╠═══╬═══╬═══╬═══ ... ═══╣
+    Sun ║░░░║▓▓▓║▓▓▓║▓▓▓ ... ░░░║
+        ╚═══╩═══╩═══╩═══ ... ═══╝
+
+    Uses single-line borders for weekdays, double-line for weekends.
+    ▓▓▓ (dark shade, green) = allowed, ░░░ (light shade, dim) = blocked.
+    """
+    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+    # Header row with hours
+    header = "       "
+    for h in range(24):
+        header += f"{h:02d}  "
+    print(Colors.dim(header))
+
+    # Top border
+    print("       ┌" + "───┬" * 23 + "───┐")
+
+    # Data rows
+    for day_idx in range(7):
+        is_weekend = day_idx >= 5
+        label = day_names[day_idx]
+        sep = "║" if is_weekend else "│"
+
+        row_str = f"  {label}  {sep}"
+        for h in range(24):
+            idx = (day_idx * 24) + h
+            if schedule[idx] == '1':
+                row_str += Colors.GREEN + "▓▓▓" + Colors.RESET + sep
+            else:
+                row_str += Colors.dim("░░░") + sep
+        print(row_str)
+
+        # Row separator
+        if day_idx == 4:
+            print("       ╞" + "═══╪" * 23 + "═══╡")
+        elif day_idx == 5:
+            print("       ╠" + "═══╬" * 23 + "═══╣")
+        elif day_idx == 6:
+            print("       ╚" + "═══╩" * 23 + "═══╝")
+        else:
+            print("       ├" + "───┼" * 23 + "───┤")
+
+    print()
+    print(f"  {Colors.GREEN}▓▓▓{Colors.RESET} allowed  {Colors.dim('░░░')} blocked")
+    print()
+
+
+def _parse_schedule_spec(spec: str) -> list[tuple[int, int, bool]]:
+    """Parse a schedule spec into (day, hour, allowed) tuples.
+
+    Spec format: '<days> <hours> <+|->'
+    Days: mon, tue, ..., sun, or ranges: mon..fri
+    Hours: 00-23, or ranges: 16..21, or 'all'
+    Action: + (permit) or - (deny)
+
+    Examples:
+        'mon 16 +'           -> [(0, 16, True)]
+        'mon..fri 16..21 +'  -> 5 days × 6 hours = 30 tuples
+        'sat..sun all -'     -> 2 days × 24 hours = 48 tuples
+
+    Returns list of (day_index, hour, allowed) tuples.
+    """
+    from playtimed.db import DAYS
+    parts = spec.strip().split()
+    if len(parts) != 3:
+        raise ValueError(f"Invalid spec '{spec}': expected '<days> <hours> <+|->'")
+
+    day_expr, hour_expr, action = parts
+
+    # Parse action
+    if action == '+':
+        allowed = True
+    elif action == '-':
+        allowed = False
+    else:
+        raise ValueError(f"Invalid action '{action}': use + or -")
+
+    # Parse days
+    if '..' in day_expr:
+        d_start, d_end = day_expr.lower().split('..')
+        i_start = DAYS.index(d_start)
+        i_end = DAYS.index(d_end)
+        days = list(range(i_start, i_end + 1))
+    else:
+        days = [DAYS.index(day_expr.lower())]
+
+    # Parse hours
+    if hour_expr == 'all':
+        hours = list(range(24))
+    elif '..' in hour_expr:
+        h_start, h_end = hour_expr.split('..')
+        hours = list(range(int(h_start), int(h_end) + 1))
+    else:
+        hours = [int(hour_expr)]
+
+    return [(d, h, allowed) for d in days for h in hours]
+
+
+def cmd_schedule_set(args):
+    """Set schedule slots from CLI specs.
+
+    Examples:
+        playtimed schedule set anders mon 16 +
+        playtimed schedule set anders mon..fri 16..21 +,sat..sun 09..22 +
+        playtimed schedule set anders mon..sun all -
+    """
+    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    try:
+        db = ActivityDB(db_path)
+    except Exception:
+        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    user = args.username
+    limits = db.get_user_limits(user)
+    if not limits:
+        print(f"No user '{user}' configured.", file=sys.stderr)
+        sys.exit(1)
+
+    schedule = list(db.get_schedule(user))
+
+    # Join remaining args and split on commas
+    spec_str = ' '.join(args.spec)
+    specs = [s.strip() for s in spec_str.split(',')]
+
+    total_changes = 0
+    for spec in specs:
+        try:
+            changes = _parse_schedule_spec(spec)
+            for day, hour, allowed in changes:
+                idx = (day * 24) + hour
+                schedule[idx] = '1' if allowed else '0'
+                total_changes += 1
+        except (ValueError, IndexError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    db.set_schedule(user, ''.join(schedule))
+    print(f"Updated {total_changes} slots.")
+    print()
+    _print_schedule_grid(''.join(schedule))
+
+
+def cmd_schedule_edit(args):
+    """Interactive curses-based schedule editor.
+
+    Draws a 7×24 grid with box-drawing characters. Use arrow keys
+    to move the cursor (shown as a blinking █ block), spacebar to
+    cycle paint mode (off → paint allow → paint block), and q to
+    save and quit. In paint mode, arrow keys fill cells as you move.
+
+        ┌───┬───┬───┬─── ... ───┐
+    Mon │░░░│ █ │▓▓▓│▓▓▓ ... ░░░│   <- cursor on hour 01
+        ├───┼───┼───┼─── ... ───┤
+        ...
+    """
+    import curses
+    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    try:
+        db = ActivityDB(db_path)
+    except Exception:
+        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    user = args.username
+    limits = db.get_user_limits(user)
+    if not limits:
+        print(f"No user '{user}' configured.", file=sys.stderr)
+        sys.exit(1)
+
+    schedule = list(db.get_schedule(user))
+    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+    def editor(stdscr):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)   # allowed
+        curses.init_pair(2, curses.COLOR_WHITE, -1)    # blocked (dim)
+        curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)  # cursor
+
+        cur_day = 0
+        cur_hour = 0
+        painting = None  # None = not painting, '1' = painting allowed, '0' = painting blocked
+
+        while True:
+            stdscr.clear()
+            stdscr.addstr(0, 0, f"Schedule Editor: {user}", curses.A_BOLD)
+            stdscr.addstr(1, 0, f"Gaming limit: {limits['gaming_limit']} min/day")
+
+            # Header row
+            header = "       "
+            for h in range(24):
+                header += f"{h:02d}  "
+            stdscr.addstr(3, 0, header, curses.A_DIM)
+
+            # Top border
+            stdscr.addstr(4, 0, "       ┌" + "───┬" * 23 + "───┐")
+
+            for day_idx in range(7):
+                is_weekend = day_idx >= 5
+                row_y = 5 + (day_idx * 2)
+                sep = "║" if is_weekend else "│"
+
+                stdscr.addstr(row_y, 0, f"  {day_names[day_idx]}  {sep}")
+                for h in range(24):
+                    idx = (day_idx * 24) + h
+                    col_x = 7 + (h * 4) + 1  # after label and first sep
+                    is_cursor = (day_idx == cur_day and h == cur_hour)
+
+                    if is_cursor:
+                        stdscr.addstr(row_y, col_x, " █ ", curses.color_pair(3) | curses.A_BLINK)
+                    elif schedule[idx] == '1':
+                        stdscr.addstr(row_y, col_x, "▓▓▓", curses.color_pair(1))
+                    else:
+                        stdscr.addstr(row_y, col_x, "░░░", curses.A_DIM)
+                    stdscr.addstr(row_y, col_x + 3, sep)
+
+                # Row separator
+                sep_y = row_y + 1
+                if day_idx == 4:
+                    stdscr.addstr(sep_y, 0, "       ╞" + "═══╪" * 23 + "═══╡")
+                elif day_idx == 5:
+                    stdscr.addstr(sep_y, 0, "       ╠" + "═══╬" * 23 + "═══╣")
+                elif day_idx == 6:
+                    stdscr.addstr(sep_y, 0, "       ╚" + "═══╩" * 23 + "═══╝")
+                else:
+                    stdscr.addstr(sep_y, 0, "       ├" + "───┼" * 23 + "───┤")
+
+            # Legend
+            info_y = 5 + (7 * 2) + 1
+            if painting == '1':
+                mode_str = "  MODE: PAINT ALLOW ▓"
+            elif painting == '0':
+                mode_str = "  MODE: PAINT BLOCK ░"
+            else:
+                mode_str = "  MODE: single toggle"
+            stdscr.addstr(info_y, 0, "  ←↑↓→ navigate  ENTER toggle  SPACE paint mode  q save  ESC cancel" + mode_str)
+
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key == ord('q'):
+                return True  # save
+            elif key == 27:  # ESC
+                return False  # cancel
+            elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+                # Toggle current cell
+                idx = (cur_day * 24) + cur_hour
+                schedule[idx] = '0' if schedule[idx] == '1' else '1'
+            elif key == ord(' '):
+                if painting is None:
+                    # Enter paint-allow mode, set current cell to allowed
+                    painting = '1'
+                    schedule[(cur_day * 24) + cur_hour] = '1'
+                elif painting == '1':
+                    # Switch to paint-block mode, set current cell to blocked
+                    painting = '0'
+                    schedule[(cur_day * 24) + cur_hour] = '0'
+                else:
+                    # Back to single-toggle mode
+                    painting = None
+            elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT):
+                if key == curses.KEY_UP:
+                    cur_day = (cur_day - 1) % 7
+                elif key == curses.KEY_DOWN:
+                    cur_day = (cur_day + 1) % 7
+                elif key == curses.KEY_LEFT:
+                    cur_hour = (cur_hour - 1) % 24
+                elif key == curses.KEY_RIGHT:
+                    cur_hour = (cur_hour + 1) % 24
+                # Paint as we move if in a paint mode
+                if painting is not None:
+                    schedule[(cur_day * 24) + cur_hour] = painting
+
+    save = curses.wrapper(editor)
+    if save:
+        db.set_schedule(user, ''.join(schedule))
+        print("Schedule saved.")
+    else:
+        print("Cancelled.")
+
+
+def cmd_schedule_export(args):
+    """Export schedules as JSON for backup or transfer."""
+    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    try:
+        db = ActivityDB(db_path)
+    except Exception:
+        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    user = getattr(args, 'username', None)
+    if user:
+        users = [user]
+    else:
+        users = db.get_all_monitored_users()
+
+    data = {}
+    for u in users:
+        limits = db.get_user_limits(u)
+        if not limits:
+            continue
+        data[u] = {
+            "schedule": db.get_schedule(u),
+            "gaming_limit": limits['gaming_limit'],
+            "daily_total": limits.get('daily_total', 0),
+        }
+
+    print(json.dumps(data, indent=2))
+
+
+def cmd_schedule_import(args):
+    """Import schedules from JSON file with validation."""
+    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    try:
+        db = ActivityDB(db_path)
+    except Exception:
+        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with open(args.file) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"Error reading {args.file}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(data, dict):
+        print("Error: Expected JSON object with usernames as keys.", file=sys.stderr)
+        sys.exit(1)
+
+    errors = []
+    for user, entry in data.items():
+        if not isinstance(entry, dict) or 'schedule' not in entry:
+            errors.append(f"  {user}: missing 'schedule' key")
+            continue
+        sched = entry['schedule']
+        if len(sched) != 168:
+            errors.append(f"  {user}: schedule length {len(sched)}, expected 168")
+            continue
+        if not all(c in '01' for c in sched):
+            errors.append(f"  {user}: schedule contains invalid characters (expected only 0/1)")
+            continue
+        if not db.get_user_limits(user):
+            errors.append(f"  {user}: user not found in database")
+
+    if errors:
+        print("Validation errors:", file=sys.stderr)
+        for e in errors:
+            print(e, file=sys.stderr)
+        sys.exit(1)
+
+    for user, entry in data.items():
+        db.set_schedule(user, entry['schedule'])
+        print(f"Imported schedule for {user}")
 
 
 def format_runtime(seconds: int) -> str:
@@ -1845,6 +2357,35 @@ Examples:
     report_parser.add_argument("user", nargs="?", help="User to check (default: all)")
     report_parser.add_argument("--days", type=int, default=7, help="Number of days (default: 7)")
 
+    # Heatmap command
+    heatmap_parser = subparsers.add_parser("heatmap", help="Show activity heatmap by day/hour")
+    heatmap_parser.add_argument("user", nargs="?", help="User to check (default: all)")
+    heatmap_parser.add_argument("--days", type=int, default=7, help="Number of days (default: 7)")
+
+    # Schedule command
+    schedule_parser = subparsers.add_parser("schedule", help="View/edit schedule grid")
+    schedule_sub = schedule_parser.add_subparsers(dest="action")
+
+    schedule_sub.add_parser("show", help="Show schedule grid (default)")
+    schedule_show = schedule_sub.add_parser("view", help="Show schedule grid")
+    schedule_show.add_argument("user", nargs="?", help="User to check (default: all)")
+
+    schedule_set = schedule_sub.add_parser("set", help="Set schedule slots")
+    schedule_set.add_argument("username", help="Username")
+    schedule_set.add_argument("spec", nargs="+", help="Spec: <days> <hours> <+|-> (comma-separated)")
+
+    schedule_edit = schedule_sub.add_parser("edit", help="Interactive schedule editor")
+    schedule_edit.add_argument("username", help="Username")
+
+    schedule_export = schedule_sub.add_parser("export", help="Export schedules as JSON")
+    schedule_export.add_argument("username", nargs="?", help="User (default: all)")
+
+    schedule_import = schedule_sub.add_parser("import", help="Import schedules from JSON")
+    schedule_import.add_argument("file", help="JSON file to import")
+
+    # Allow bare 'schedule' and 'schedule <user>' to show the grid
+    schedule_parser.add_argument("user", nargs="?", help="User to check (default: all)")
+
     # Mode command
     mode_parser = subparsers.add_parser("mode", help="View or set daemon mode")
     mode_parser.add_argument("set_mode", nargs="?", choices=["normal", "passthrough", "strict"],
@@ -1952,6 +2493,20 @@ Examples:
         cmd_sessions(args)
     elif args.command == "report":
         cmd_report(args)
+    elif args.command == "heatmap":
+        cmd_heatmap(args)
+    elif args.command == "schedule":
+        action = getattr(args, 'action', None)
+        if action == "set":
+            cmd_schedule_set(args)
+        elif action == "edit":
+            cmd_schedule_edit(args)
+        elif action == "export":
+            cmd_schedule_export(args)
+        elif action == "import":
+            cmd_schedule_import(args)
+        else:
+            cmd_schedule(args)
     elif args.command == "maintenance":
         cmd_maintenance(args)
     elif args.command == "mode":
