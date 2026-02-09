@@ -532,6 +532,16 @@ class ClaudeDaemon:
 
                 # Skip launchers only if NOT a gaming match
                 if not pdef and self._match_process_to_pattern(proc_name, cmdline, launcher_patterns):
+                    # High-CPU launcher is suspicious — likely a misclassified game
+                    try:
+                        cpu = proc.cpu_percent(interval=0.1)
+                    except psutil.NoSuchProcess:
+                        continue
+                    if cpu >= 25:
+                        pid = proc.info['pid']
+                        log.warning(f"Launcher-classified process {proc_name} (PID {pid}) "
+                                    f"at {cpu:.0f}% CPU — possible misclassification")
+                        self._check_discovery(user, proc_name, cmdline, pid, cpu)
                     continue
                 if pdef:
                     pid = proc.info['pid']
@@ -628,6 +638,12 @@ class ClaudeDaemon:
                         self._discover_from_catchall(
                             user, proc_name, cmdline, pid,
                             matched_pattern)
+
+                    # High-CPU launcher is suspicious — flag for discovery
+                    if matched_pattern.get('category') == 'launcher' and cpu >= 25:
+                        log.warning(f"Launcher-classified process {proc_name} (PID {pid}) "
+                                    f"at {cpu:.0f}% CPU — possible misclassification")
+                        self._check_discovery(user, proc_name, cmdline, pid, cpu)
 
                     # Handle disallowed processes (unless passthrough mode)
                     if state == 'disallowed' and self.mode != 'passthrough':
