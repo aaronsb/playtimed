@@ -527,12 +527,12 @@ class ClaudeDaemon:
                 cmdline = ' '.join(proc.info.get('cmdline') or [])
                 proc_name = proc.info.get('name', '')
 
-                # Skip launchers
-                if self._match_process_to_pattern(proc_name, cmdline, launcher_patterns):
-                    continue
-
-                # Check gaming patterns
+                # Check gaming patterns first (takes priority over launcher)
                 pdef = self._match_process_to_pattern(proc_name, cmdline, gaming_patterns)
+
+                # Skip launchers only if NOT a gaming match
+                if not pdef and self._match_process_to_pattern(proc_name, cmdline, launcher_patterns):
+                    continue
                 if pdef:
                     pid = proc.info['pid']
                     already_tracked = pid in prev_games
