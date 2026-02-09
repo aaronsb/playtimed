@@ -16,6 +16,22 @@ DEFAULT_DB_PATH = "/var/lib/playtimed/playtimed.db"
 DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
 SCHEDULE_LEN = 168  # 7 days * 24 hours
 DEFAULT_SCHEDULE = '0' * SCHEDULE_LEN
+DEFAULT_DAILY_LIMITS = '120,120,120,120,120,120,120'  # 7 days, minutes
+
+
+def parse_daily_limits(s: str) -> list[int]:
+    """Parse comma-separated daily limits string into list of 7 ints."""
+    if not s:
+        return [120] * 7
+    parts = s.split(',')
+    if len(parts) != 7:
+        return [120] * 7
+    return [int(x) for x in parts]
+
+
+def format_daily_limits(limits: list[int]) -> str:
+    """Format list of 7 ints as comma-separated string."""
+    return ','.join(str(x) for x in limits)
 
 
 def schedule_from_ranges(wd_start: str, wd_end: str,
@@ -97,7 +113,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 pattern TEXT NOT NULL,
                 name TEXT NOT NULL,
-                category TEXT,  -- 'gaming', 'launcher', 'productive', 'educational' (NULL for discovered)
+                category TEXT,  -- 'gaming', 'launcher', 'productive', 'educational', 'creative' (NULL for discovered)
                 pattern_type TEXT NOT NULL DEFAULT 'process',  -- 'process' or 'browser_domain'
                 browser TEXT,  -- 'chrome', 'chromium', 'firefox' (NULL for processes)
                 monitor_state TEXT NOT NULL DEFAULT 'active',
@@ -382,6 +398,16 @@ def migrate_db(db_path: str = DEFAULT_DB_PATH) -> None:
             for row in rows:
                 sched = schedule_from_ranges(row[1], row[2], row[3], row[4])
                 conn.execute("UPDATE user_limits SET schedule = ? WHERE user = ?", (sched, row[0]))
+
+        # Add daily_limits column to user_limits if not present
+        if 'daily_limits' not in ul_columns:
+            conn.execute("ALTER TABLE user_limits ADD COLUMN daily_limits TEXT")
+            # Migrate: use existing gaming_limit for all 7 days
+            rows = conn.execute("SELECT user, gaming_limit FROM user_limits").fetchall()
+            for row in rows:
+                gl = row[1] or 120
+                dl = ','.join([str(gl)] * 7)
+                conn.execute("UPDATE user_limits SET daily_limits = ? WHERE user = ?", (dl, row[0]))
 
         # Create hourly_activity table if not exists
         conn.executescript("""
@@ -1064,6 +1090,28 @@ class ActivityDB:
             conn.execute(
                 "UPDATE user_limits SET schedule = ?, updated_at = ? WHERE user = ?",
                 (schedule, now, user)
+            )
+
+    def get_daily_limits(self, user: str) -> list[int]:
+        """Get per-day gaming limits (7 ints, Mon-Sun, in minutes)."""
+        limits = self.get_user_limits(user)
+        if not limits:
+            return [120] * 7
+        dl = limits.get('daily_limits')
+        if dl:
+            return parse_daily_limits(dl)
+        # Fall back to global gaming_limit for all days
+        gl = limits.get('gaming_limit', 120)
+        return [gl] * 7
+
+    def set_daily_limits(self, user: str, daily_limits: list[int]):
+        """Write per-day gaming limits (7 ints, Mon-Sun, in minutes)."""
+        now = datetime.now().isoformat()
+        dl_str = format_daily_limits(daily_limits)
+        with get_connection(self.db_path) as conn:
+            conn.execute(
+                "UPDATE user_limits SET daily_limits = ?, updated_at = ? WHERE user = ?",
+                (dl_str, now, user)
             )
 
     def get_all_monitored_users(self) -> list[str]:

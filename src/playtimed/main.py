@@ -21,7 +21,7 @@ from typing import Optional
 import psutil
 import yaml
 
-from .db import ActivityDB
+from .db import ActivityDB, get_connection
 from .router import MessageRouter, MessageContext, get_router
 from .browser import BrowserMonitor
 
@@ -912,6 +912,10 @@ class ClaudeDaemon:
                 except psutil.NoSuchProcess:
                     pass
 
+            # Log the termination event
+            self.db.log_event(user, "terminated", app=proc.name,
+                              pid=proc.pid, details=reason)
+
             if notify:
                 notifier.send("🎮 Time's Up",
                              MessageTemplates.get(reason, app=proc.name))
@@ -971,8 +975,9 @@ class ClaudeDaemon:
             gaming_used += int(elapsed_seconds)
             total_used += int(elapsed_seconds)
 
-        # Calculate remaining time
-        gaming_limit = limits.get('gaming_limit', 120) * 60  # seconds
+        # Calculate remaining time (per-day limit)
+        today_limits = self.db.get_daily_limits(user)
+        gaming_limit = today_limits[datetime.now().weekday()] * 60  # seconds
         gaming_remaining = max(0, gaming_limit - gaming_used)
         gaming_remaining_mins = gaming_remaining // 60
 
@@ -983,6 +988,9 @@ class ClaudeDaemon:
         warned_30 = db_state.get('warned_30', 0) if db_state else 0
         warned_15 = db_state.get('warned_15', 0) if db_state else 0
         warned_5 = db_state.get('warned_5', 0) if db_state else 0
+
+        # Track kills this cycle for daily summary
+        kills_this_cycle = 0
 
         # Process new game starts
         for game in current_games:
@@ -999,12 +1007,14 @@ class ClaudeDaemon:
                     self.db.log_event(user, "blocked_schedule", app=game.name,
                                       details=outside_reason, pid=game.pid)
                     self._kill_process(game, user, notify=False)
+                    kills_this_cycle += 1
                     continue
 
                 if gaming_remaining <= 0:
                     self.router.blocked_launch(user, game.name)
                     self.db.log_event(user, "blocked_quota", app=game.name, pid=game.pid)
                     self._kill_process(game, user, notify=False)
+                    kills_this_cycle += 1
                     continue
 
                 # Allowed - start session tracking
@@ -1057,11 +1067,13 @@ class ClaudeDaemon:
                     log.info(f"Session ended (enforced): {game.name} (PID {game.pid}) for {user}")
                 self._kill_process(game, user, notify=False)
                 self.router.enforcement(user, game.name)
+                kills_this_cycle += 1
 
         # Update database state
         self.db.update_daily_summary(user,
                                       gaming_seconds=int(elapsed_seconds) if was_gaming_active else 0,
-                                      total_seconds=int(elapsed_seconds) if was_gaming_active else 0)
+                                      total_seconds=int(elapsed_seconds) if was_gaming_active else 0,
+                                      enforcements=kills_this_cycle)
         self.db.update_hourly_activity(user,
                                         gaming_seconds=int(elapsed_seconds) if was_gaming_active else 0,
                                         total_seconds=int(elapsed_seconds) if was_gaming_active else 0)
@@ -1127,12 +1139,9 @@ def _get_user_status_row(db, user: str) -> dict:
     total_used, gaming_used = db.get_time_used_today(user)
 
     limits = db.get_user_limits(user)
-    if limits:
-        gaming_limit = limits['gaming_limit'] * 60
-        total_limit = limits['daily_total'] * 60
-    else:
-        gaming_limit = 120 * 60
-        total_limit = 180 * 60
+    today_limits = db.get_daily_limits(user)
+    gaming_limit = today_limits[datetime.now().weekday()] * 60
+    total_limit = (limits['daily_total'] * 60) if limits else 180 * 60
 
     gaming_remaining = max(0, gaming_limit - gaming_used)
     total_remaining = max(0, total_limit - total_used)
@@ -1342,6 +1351,58 @@ def cmd_history(args):
 
         print_table(headers, rows)
         print()
+
+
+def cmd_audit(args):
+    """Show process termination history."""
+    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    try:
+        db = ActivityDB(db_path)
+    except Exception:
+        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    user = getattr(args, 'user', None)
+    days = getattr(args, 'days', 30) or 30
+
+    with get_connection(db.db_path) as conn:
+        if user:
+            rows = conn.execute("""
+                SELECT timestamp, user, app, details, pid
+                FROM events WHERE event_type = 'terminated'
+                AND user = ?
+                AND timestamp >= datetime('now', ?)
+                ORDER BY timestamp DESC
+            """, (user, f'-{days} days')).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT timestamp, user, app, details, pid
+                FROM events WHERE event_type = 'terminated'
+                AND timestamp >= datetime('now', ?)
+                ORDER BY timestamp DESC
+            """, (f'-{days} days',)).fetchall()
+
+    if not rows:
+        print(f"No terminations in the last {days} days.")
+        return
+
+    print(Colors.header(f"Termination Audit") + f" (last {days} days)")
+    print()
+
+    headers = ["Time", "User", "App", "Reason", "PID"]
+    table_rows = []
+    for r in rows:
+        ts = r['timestamp'][:16].replace('T', ' ')
+        table_rows.append([
+            ts,
+            r['user'],
+            r['app'] or '?',
+            r['details'] or '?',
+            str(r['pid'] or ''),
+        ])
+
+    print_table(headers, table_rows)
+    print(f"\n  Total: {Colors.bold(str(len(rows)))} terminations")
 
 
 def cmd_sessions(args):
@@ -1579,27 +1640,29 @@ def cmd_schedule(args):
 
         schedule = db.get_schedule(u)
 
+        daily_limits = db.get_daily_limits(u)
+
         print(Colors.header(f"━━━ {u} ━━━"))
-        print(f"  Gaming limit: {Colors.bold(str(limits['gaming_limit']))} min/day")
         print()
 
-        _print_schedule_grid(schedule)
+        _print_schedule_grid(schedule, daily_limits)
 
 
-def _print_schedule_grid(schedule: str):
+def _print_schedule_grid(schedule: str, daily_limits: list[int] = None):
     """Print a 7×24 schedule grid with CP437 box-drawing characters.
 
-    Renders the schedule as a bordered grid with shade characters:
+    Renders the schedule as a bordered grid with shade characters and
+    an optional daily limit column:
 
         ┌───┬───┬───┬─── ... ───┐
-    Mon │░░░│░░░│▓▓▓│▓▓▓ ... ░░░│
+    Mon │░░░│░░░│▓▓▓│▓▓▓ ... ░░░│  120 min
         ├───┼───┼───┼─── ... ───┤
-    Tue │░░░│░░░│▓▓▓│▓▓▓ ... ░░░│
+    Tue │░░░│░░░│▓▓▓│▓▓▓ ... ░░░│  120 min
         ...
-        ╞═══╪═══╪═══╪═══ ... ═══╡   <- weekday/weekend transition
-    Sat ║░░░║▓▓▓║▓▓▓║▓▓▓ ... ░░░║
+        ╞═══╪═══╪═══╪═══ ... ═══╡
+    Sat ║░░░║▓▓▓║▓▓▓║▓▓▓ ... ░░░║  180 min
         ╠═══╬═══╬═══╬═══ ... ═══╣
-    Sun ║░░░║▓▓▓║▓▓▓║▓▓▓ ... ░░░║
+    Sun ║░░░║▓▓▓║▓▓▓║▓▓▓ ... ░░░║  180 min
         ╚═══╩═══╩═══╩═══ ... ═══╝
 
     Uses single-line borders for weekdays, double-line for weekends.
@@ -1611,6 +1674,8 @@ def _print_schedule_grid(schedule: str):
     header = "       "
     for h in range(24):
         header += f"{h:02d}  "
+    if daily_limits:
+        header += " Limit"
     print(Colors.dim(header))
 
     # Top border
@@ -1629,6 +1694,13 @@ def _print_schedule_grid(schedule: str):
                 row_str += Colors.GREEN + "▓▓▓" + Colors.RESET + sep
             else:
                 row_str += Colors.dim("░░░") + sep
+
+        if daily_limits:
+            mins = daily_limits[day_idx]
+            if mins >= 60:
+                row_str += f"  {mins // 60}h{mins % 60:02d}m"
+            else:
+                row_str += f"  {mins}m"
         print(row_str)
 
         # Row separator
@@ -1739,7 +1811,7 @@ def cmd_schedule_set(args):
     db.set_schedule(user, ''.join(schedule))
     print(f"Updated {total_changes} slots.")
     print()
-    _print_schedule_grid(''.join(schedule))
+    _print_schedule_grid(''.join(schedule), db.get_daily_limits(user))
 
 
 def cmd_schedule_edit(args):
@@ -1770,6 +1842,7 @@ def cmd_schedule_edit(args):
         sys.exit(1)
 
     schedule = list(db.get_schedule(user))
+    daily_limits = db.get_daily_limits(user)
     day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
     def editor(stdscr):
@@ -1779,28 +1852,32 @@ def cmd_schedule_edit(args):
         curses.init_pair(1, curses.COLOR_GREEN, -1)   # allowed
         curses.init_pair(2, curses.COLOR_WHITE, -1)    # blocked (dim)
         curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)  # cursor
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)   # limit highlight
 
         cur_day = 0
-        cur_hour = 0
+        cur_hour = 0  # 0-23 = schedule hours, 24 = limit column
         painting = None  # None = not painting, '1' = painting allowed, '0' = painting blocked
+        limit_input = ""  # digit buffer when editing limit column
 
         while True:
             stdscr.clear()
             stdscr.addstr(0, 0, f"Schedule Editor: {user}", curses.A_BOLD)
-            stdscr.addstr(1, 0, f"Gaming limit: {limits['gaming_limit']} min/day")
+            stdscr.addstr(0, 25, "Arrows:move  Enter:toggle  Space:paint  +/-:limit  q:save  Esc:cancel", curses.A_DIM)
+            on_limit = (cur_hour == 24)
 
             # Header row
             header = "       "
             for h in range(24):
                 header += f"{h:02d}  "
-            stdscr.addstr(3, 0, header, curses.A_DIM)
+            header += "  Limit"
+            stdscr.addstr(2, 0, header, curses.A_DIM)
 
             # Top border
-            stdscr.addstr(4, 0, "       ┌" + "───┬" * 23 + "───┐")
+            stdscr.addstr(3, 0, "       ┌" + "───┬" * 23 + "───┐")
 
             for day_idx in range(7):
                 is_weekend = day_idx >= 5
-                row_y = 5 + (day_idx * 2)
+                row_y = 4 + (day_idx * 2)
                 sep = "║" if is_weekend else "│"
 
                 stdscr.addstr(row_y, 0, f"  {day_names[day_idx]}  {sep}")
@@ -1817,6 +1894,20 @@ def cmd_schedule_edit(args):
                         stdscr.addstr(row_y, col_x, "░░░", curses.A_DIM)
                     stdscr.addstr(row_y, col_x + 3, sep)
 
+                # Daily limit column
+                limit_x = 7 + (24 * 4) + 2
+                is_limit_cursor = (day_idx == cur_day and on_limit)
+                if is_limit_cursor and limit_input:
+                    limit_str = f" {limit_input:>4s}▏"
+                elif is_limit_cursor:
+                    mins = daily_limits[day_idx]
+                    limit_str = f"[{mins:>4d}]"
+                else:
+                    mins = daily_limits[day_idx]
+                    limit_str = f" {mins:>4d} "
+                attr = curses.color_pair(4) | curses.A_BOLD if is_limit_cursor else curses.A_DIM
+                stdscr.addstr(row_y, limit_x, limit_str, attr)
+
                 # Row separator
                 sep_y = row_y + 1
                 if day_idx == 4:
@@ -1829,54 +1920,88 @@ def cmd_schedule_edit(args):
                     stdscr.addstr(sep_y, 0, "       ├" + "───┼" * 23 + "───┤")
 
             # Legend
-            info_y = 5 + (7 * 2) + 1
-            if painting == '1':
+            info_y = 4 + (7 * 2) + 1
+            if on_limit:
+                mode_str = "  LIMIT: type minutes, ENTER confirm, +/- by 15"
+            elif painting == '1':
                 mode_str = "  MODE: PAINT ALLOW ▓"
             elif painting == '0':
                 mode_str = "  MODE: PAINT BLOCK ░"
             else:
                 mode_str = "  MODE: single toggle"
-            stdscr.addstr(info_y, 0, "  ←↑↓→ navigate  ENTER toggle  SPACE paint mode  q save  ESC cancel" + mode_str)
+            stdscr.addstr(info_y, 0, "  ←↑↓→ navigate  ENTER toggle  SPACE paint mode  q save  ESC cancel")
+            stdscr.addstr(info_y + 1, 0, mode_str)
 
             stdscr.refresh()
 
             key = stdscr.getch()
-            if key == ord('q'):
+            if key == ord('q') and not limit_input:
                 return True  # save
             elif key == 27:  # ESC
-                return False  # cancel
-            elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
-                # Toggle current cell
+                if limit_input:
+                    limit_input = ""  # cancel limit edit
+                else:
+                    return False  # cancel editor
+
+            # Limit column: digit entry
+            elif on_limit and chr(key).isdigit() if 0 <= key <= 255 else False:
+                limit_input += chr(key)
+                if len(limit_input) > 4:
+                    limit_input = limit_input[-4:]
+            elif on_limit and key in (curses.KEY_BACKSPACE, 127, 8):
+                limit_input = limit_input[:-1]
+            elif on_limit and key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+                if limit_input:
+                    val = int(limit_input)
+                    daily_limits[cur_day] = min(1440, max(0, val))
+                    limit_input = ""
+            elif on_limit and (key == ord('+') or key == ord('=')):
+                limit_input = ""
+                daily_limits[cur_day] = min(1440, daily_limits[cur_day] + 15)
+            elif on_limit and (key == ord('-') or key == ord('_')):
+                limit_input = ""
+                daily_limits[cur_day] = max(0, daily_limits[cur_day] - 15)
+
+            # Schedule grid controls
+            elif not on_limit and key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
                 idx = (cur_day * 24) + cur_hour
                 schedule[idx] = '0' if schedule[idx] == '1' else '1'
-            elif key == ord(' '):
+            elif not on_limit and key == ord(' '):
                 if painting is None:
-                    # Enter paint-allow mode, set current cell to allowed
                     painting = '1'
                     schedule[(cur_day * 24) + cur_hour] = '1'
                 elif painting == '1':
-                    # Switch to paint-block mode, set current cell to blocked
                     painting = '0'
                     schedule[(cur_day * 24) + cur_hour] = '0'
                 else:
-                    # Back to single-toggle mode
                     painting = None
+
+            # Navigation (both grid and limit)
             elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT):
+                # Commit any pending limit input on nav
+                if limit_input:
+                    val = int(limit_input)
+                    daily_limits[cur_day] = min(1440, max(0, val))
+                    limit_input = ""
                 if key == curses.KEY_UP:
                     cur_day = (cur_day - 1) % 7
                 elif key == curses.KEY_DOWN:
                     cur_day = (cur_day + 1) % 7
                 elif key == curses.KEY_LEFT:
-                    cur_hour = (cur_hour - 1) % 24
+                    cur_hour = max(0, cur_hour - 1)
                 elif key == curses.KEY_RIGHT:
-                    cur_hour = (cur_hour + 1) % 24
-                # Paint as we move if in a paint mode
-                if painting is not None:
+                    cur_hour = min(24, cur_hour + 1)
+                # Paint as we move if in a paint mode (grid only)
+                if painting is not None and cur_hour < 24:
                     schedule[(cur_day * 24) + cur_hour] = painting
+                # Exit paint mode when entering limit column
+                if cur_hour == 24:
+                    painting = None
 
     save = curses.wrapper(editor)
     if save:
         db.set_schedule(user, ''.join(schedule))
+        db.set_daily_limits(user, daily_limits)
         print("Schedule saved.")
     else:
         print("Cancelled.")
@@ -1904,8 +2029,7 @@ def cmd_schedule_export(args):
             continue
         data[u] = {
             "schedule": db.get_schedule(u),
-            "gaming_limit": limits['gaming_limit'],
-            "daily_total": limits.get('daily_total', 0),
+            "daily_limits": db.get_daily_limits(u),
         }
 
     print(json.dumps(data, indent=2))
@@ -1943,6 +2067,11 @@ def cmd_schedule_import(args):
         if not all(c in '01' for c in sched):
             errors.append(f"  {user}: schedule contains invalid characters (expected only 0/1)")
             continue
+        if 'daily_limits' in entry:
+            dl = entry['daily_limits']
+            if not isinstance(dl, list) or len(dl) != 7 or not all(isinstance(x, int) and x >= 0 for x in dl):
+                errors.append(f"  {user}: daily_limits must be list of 7 non-negative integers")
+                continue
         if not db.get_user_limits(user):
             errors.append(f"  {user}: user not found in database")
 
@@ -1954,6 +2083,8 @@ def cmd_schedule_import(args):
 
     for user, entry in data.items():
         db.set_schedule(user, entry['schedule'])
+        if 'daily_limits' in entry:
+            db.set_daily_limits(user, entry['daily_limits'])
         print(f"Imported schedule for {user}")
 
 
@@ -2245,14 +2376,14 @@ def cmd_user(args):
         sys.exit(1)
 
     if args.action == "list":
+        day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
         users = db.get_all_monitored_users()
         for user in users:
             limits = db.get_user_limits(user)
-            print(f"\n{user}:")
-            print(f"  Daily total: {limits['daily_total']} min")
-            print(f"  Gaming limit: {limits['gaming_limit']} min")
-            print(f"  Weekday: {limits['weekday_start']} - {limits['weekday_end']}")
-            print(f"  Weekend: {limits['weekend_start']} - {limits['weekend_end']}")
+            dl = db.get_daily_limits(user)
+            print(f"\n{Colors.bold(user)}:")
+            print(f"  Daily limits: {', '.join(f'{day_names[i]} {dl[i]}m' for i in range(7))}")
+            print(f"  Use 'playtimed schedule {user}' for full grid")
 
     elif args.action == "add":
         db.set_user_limits(
@@ -2265,6 +2396,29 @@ def cmd_user(args):
             weekend_end=args.weekend_end or "22:00"
         )
         print(f"Added/updated limits for {args.username}")
+
+    elif args.action == "edit":
+        require_root("user edit")
+        user = args.username
+        limits = db.get_user_limits(user)
+        if not limits:
+            print(f"No user '{user}' configured. Use 'user add' first.", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Editing limits for {Colors.bold(user)}")
+        print("Use 'playtimed schedule edit' for per-day gaming limits and schedule.")
+        print("Press Enter to keep current value, or type new value.\n")
+
+        current = limits.get('daily_total', 180)
+        val = input(f"  Daily total screen time (min) [{current}]: ").strip()
+        if val:
+            try:
+                db.set_user_limits(user, daily_total=int(val))
+                print(f"\nUpdated {user}: daily_total={val}")
+            except ValueError:
+                print(f"    Invalid value, keeping {current}")
+        else:
+            print("\nNo changes.")
 
     elif args.action == "disable":
         db.set_user_limits(args.username, enabled=0)
@@ -2352,6 +2506,11 @@ Examples:
     sessions_parser.add_argument("--date", help="Specific date (YYYY-MM-DD)")
     sessions_parser.add_argument("--days", type=int, help="Last N days")
 
+    # Audit command
+    audit_parser = subparsers.add_parser("audit", help="Show process termination history")
+    audit_parser.add_argument("user", nargs="?", help="User to check (default: all)")
+    audit_parser.add_argument("--days", type=int, default=30, help="Number of days (default: 30)")
+
     # Report command
     report_parser = subparsers.add_parser("report", help="Show weekly summary report")
     report_parser.add_argument("user", nargs="?", help="User to check (default: all)")
@@ -2400,7 +2559,7 @@ Examples:
     add_pat = pattern_sub.add_parser("add", help="Add a pattern")
     add_pat.add_argument("pattern", help="Regex pattern")
     add_pat.add_argument("name", help="Display name")
-    add_pat.add_argument("category", choices=["gaming", "launcher", "productive", "educational"])
+    add_pat.add_argument("category", choices=["gaming", "launcher", "productive", "educational", "creative"])
     add_pat.add_argument("--cpu-threshold", type=float, help="Min CPU%% to count")
     add_pat.add_argument("--notes", help="Notes about this pattern")
 
@@ -2425,7 +2584,7 @@ Examples:
 
     promote_disc = discover_sub.add_parser("promote", help="Promote to active monitoring")
     promote_disc.add_argument("id", type=int, help="Pattern ID")
-    promote_disc.add_argument("category", choices=["gaming", "launcher", "productive", "educational"],
+    promote_disc.add_argument("category", choices=["gaming", "launcher", "productive", "educational", "creative"],
                               help="Category for monitoring")
     promote_disc.add_argument("--name", help="Display name (e.g., 'YouTube' instead of 'youtube.com')")
 
@@ -2473,6 +2632,9 @@ Examples:
     add_user.add_argument("--weekend-start", help="Weekend start time (HH:MM)")
     add_user.add_argument("--weekend-end", help="Weekend end time (HH:MM)")
 
+    edit_user = user_sub.add_parser("edit", help="Interactive user limits editor")
+    edit_user.add_argument("username", help="Username")
+
     dis_user = user_sub.add_parser("disable", help="Disable user monitoring")
     dis_user.add_argument("username", help="Username")
 
@@ -2491,6 +2653,8 @@ Examples:
         cmd_history(args)
     elif args.command == "sessions":
         cmd_sessions(args)
+    elif args.command == "audit":
+        cmd_audit(args)
     elif args.command == "report":
         cmd_report(args)
     elif args.command == "heatmap":
