@@ -21,7 +21,7 @@ from typing import Optional
 import psutil
 import yaml
 
-from .db import ActivityDB, get_connection
+from .db import ActivityDB, get_connection, get_allowed_window
 from .router import MessageRouter, MessageContext, get_router
 from .browser import BrowserMonitor
 
@@ -1018,8 +1018,9 @@ class ClaudeDaemon:
                                   category="gaming", pid=game.pid)
 
                 if not allowed:
-                    self.router.outside_hours(user, limits.get('weekday_start', ''),
-                                              limits.get('weekday_end', ''))
+                    schedule = self.db.get_schedule(user)
+                    window = get_allowed_window(schedule, now.weekday())
+                    self.router.outside_hours(user, window)
                     self.db.log_event(user, "blocked_schedule", app=game.name,
                                       details=outside_reason, pid=game.pid)
                     self._kill_process(game, user, notify=False)
@@ -1055,22 +1056,23 @@ class ClaudeDaemon:
         self.active_games[user] = {g.pid: g for g in current_games}
 
         # Send warnings if gaming (flags prevent duplicates)
+        today_gaming_limit_mins = today_limits[now.weekday()]
         if gaming_active and gaming_remaining > 0:
             if gaming_remaining_mins <= 30 and not warned_30:
-                self.router.time_warning(user, 30, limits.get('gaming_limit', 120))
+                self.router.time_warning(user, 30, today_gaming_limit_mins)
                 warned_30 = 1
 
             if gaming_remaining_mins <= 15 and not warned_15:
-                self.router.time_warning(user, 15, limits.get('gaming_limit', 120))
+                self.router.time_warning(user, 15, today_gaming_limit_mins)
                 warned_15 = 1
 
             if gaming_remaining_mins <= 5 and not warned_5:
-                self.router.time_warning(user, 5, limits.get('gaming_limit', 120))
+                self.router.time_warning(user, 5, today_gaming_limit_mins)
                 warned_5 = 1
 
         # Enforce time limit
         if gaming_active and gaming_remaining <= 0:
-            self.router.time_expired(user, limits.get('gaming_limit', 120))
+            self.router.time_expired(user, today_gaming_limit_mins)
 
             # Grace period (in-line for now, could be state-based)
             grace_seconds = self.daemon_config.get('strict_grace_seconds', 30)
@@ -1381,22 +1383,25 @@ def cmd_audit(args):
     user = getattr(args, 'user', None)
     days = getattr(args, 'days', 30) or 30
 
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
     with get_connection(db.db_path) as conn:
         if user:
             rows = conn.execute("""
                 SELECT timestamp, user, app, details, pid
                 FROM events WHERE event_type = 'terminated'
                 AND user = ?
-                AND timestamp >= datetime('now', ?)
+                AND timestamp >= ?
                 ORDER BY timestamp DESC
-            """, (user, f'-{days} days')).fetchall()
+            """, (user, cutoff)).fetchall()
         else:
             rows = conn.execute("""
                 SELECT timestamp, user, app, details, pid
                 FROM events WHERE event_type = 'terminated'
-                AND timestamp >= datetime('now', ?)
+                AND timestamp >= ?
                 ORDER BY timestamp DESC
-            """, (f'-{days} days',)).fetchall()
+            """, (cutoff,)).fetchall()
 
     if not rows:
         print(f"No terminations in the last {days} days.")
@@ -2402,16 +2407,21 @@ def cmd_user(args):
             print(f"  Use 'playtimed schedule {user}' for full grid")
 
     elif args.action == "add":
-        db.set_user_limits(
-            args.username,
-            daily_total=args.daily_total or 180,
-            gaming_limit=args.gaming_limit or 120,
-            weekday_start=args.weekday_start or "16:00",
-            weekday_end=args.weekday_end or "21:00",
-            weekend_start=args.weekend_start or "09:00",
-            weekend_end=args.weekend_end or "22:00"
-        )
+        kwargs = {'daily_total': args.daily_total or 180}
+        if args.gaming_limit:
+            kwargs['gaming_limit'] = args.gaming_limit  # converted to daily_limits in set_user_limits
+        # Time ranges are converted to schedule string in set_user_limits
+        if args.weekday_start:
+            kwargs['weekday_start'] = args.weekday_start
+        if args.weekday_end:
+            kwargs['weekday_end'] = args.weekday_end
+        if args.weekend_start:
+            kwargs['weekend_start'] = args.weekend_start
+        if args.weekend_end:
+            kwargs['weekend_end'] = args.weekend_end
+        db.set_user_limits(args.username, **kwargs)
         print(f"Added/updated limits for {args.username}")
+        print(f"Use 'playtimed schedule edit {args.username}' to fine-tune the schedule.")
 
     elif args.action == "edit":
         require_root("user edit")
@@ -2448,12 +2458,12 @@ def cmd_user(args):
 def main():
     examples = """
 Examples:
-  # First-time setup: add a user with gaming limits
-  playtimed user add anders --gaming-limit 120 --daily-total 180
+  # First-time setup: add a user with initial schedule
+  playtimed user add anders --gaming-limit 120 --daily-total 180 \\
+                            --weekday-start 16:00 --weekday-end 21:00
 
-  # Set allowed gaming hours (weekdays 4pm-9pm, weekends 9am-10pm)
-  playtimed user add anders --weekday-start 16:00 --weekday-end 21:00 \\
-                            --weekend-start 09:00 --weekend-end 22:00
+  # Fine-tune schedule with the interactive editor
+  playtimed schedule edit anders
 
   # Check current status
   playtimed status
@@ -2642,11 +2652,11 @@ Examples:
     add_user = user_sub.add_parser("add", help="Add/update user limits")
     add_user.add_argument("username", help="Username to monitor")
     add_user.add_argument("--daily-total", type=int, help="Daily total minutes")
-    add_user.add_argument("--gaming-limit", type=int, help="Gaming limit minutes")
-    add_user.add_argument("--weekday-start", help="Weekday start time (HH:MM)")
-    add_user.add_argument("--weekday-end", help="Weekday end time (HH:MM)")
-    add_user.add_argument("--weekend-start", help="Weekend start time (HH:MM)")
-    add_user.add_argument("--weekend-end", help="Weekend end time (HH:MM)")
+    add_user.add_argument("--gaming-limit", type=int, help="Gaming limit minutes (sets all days)")
+    add_user.add_argument("--weekday-start", help="Initial weekday start (HH:MM, generates schedule)")
+    add_user.add_argument("--weekday-end", help="Initial weekday end (HH:MM, generates schedule)")
+    add_user.add_argument("--weekend-start", help="Initial weekend start (HH:MM, generates schedule)")
+    add_user.add_argument("--weekend-end", help="Initial weekend end (HH:MM, generates schedule)")
 
     edit_user = user_sub.add_parser("edit", help="Interactive user limits editor")
     edit_user.add_argument("username", help="Username")

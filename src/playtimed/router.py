@@ -35,8 +35,7 @@ class MessageContext:
     day: str = ""
     mode: str = ""
     grace_seconds: int = 0
-    start_time: str = ""    # HH:MM
-    end_time: str = ""      # HH:MM
+    allowed_window: str = ""  # human-readable schedule window
 
     def to_dict(self) -> dict:
         """Convert to dict for template rendering."""
@@ -51,8 +50,7 @@ class MessageContext:
             'day': self.day,
             'mode': self.mode,
             'grace_seconds': str(self.grace_seconds),
-            'start_time': self.start_time,
-            'end_time': self.end_time,
+            'allowed_window': self.allowed_window,
         }
 
 
@@ -299,9 +297,9 @@ class MessageRouter:
         nid, _ = self.send('blocked_launch', ctx)
         return nid
 
-    def outside_hours(self, user: str, start_time: str, end_time: str) -> int:
+    def outside_hours(self, user: str, allowed_window: str) -> int:
         """Notify that gaming is outside allowed hours."""
-        ctx = MessageContext(user=user, start_time=start_time, end_time=end_time)
+        ctx = MessageContext(user=user, allowed_window=allowed_window)
         nid, _ = self.send('outside_hours', ctx)
         return nid
 

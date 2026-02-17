@@ -183,8 +183,14 @@ class TestUserManagement:
 
         limits = db.get_user_limits("anders")
         assert limits['daily_total'] == 180
-        assert limits['gaming_limit'] == 120
-        assert limits['weekday_start'] == "16:00"
+        # gaming_limit is converted to daily_limits
+        dl = db.get_daily_limits("anders")
+        assert dl == [120] * 7
+        # time ranges are converted to schedule
+        sched = db.get_schedule("anders")
+        assert len(sched) == 168
+        # Hour 16 should be allowed on Monday (weekday_start=16:00)
+        assert sched[16] == '1'
 
     def test_get_all_monitored_users(self, db):
         """Test getting list of monitored users."""

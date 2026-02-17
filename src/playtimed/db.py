@@ -36,7 +36,10 @@ def format_daily_limits(limits: list[int]) -> str:
 
 def schedule_from_ranges(wd_start: str, wd_end: str,
                          we_start: str, we_end: str) -> str:
-    """Build a 168-char schedule string from start/end time ranges."""
+    """Build a 168-char schedule string from start/end time ranges.
+
+    Used as a convenience converter — the schedule string is the source of truth.
+    """
     wd_s = int(wd_start.split(':')[0]) if wd_start else 0
     wd_e = int(wd_end.split(':')[0]) if wd_end else 24
     we_s = int(we_start.split(':')[0]) if we_start else 0
@@ -48,6 +51,36 @@ def schedule_from_ranges(wd_start: str, wd_end: str,
         for hour in range(24):
             bits.append('1' if start <= hour < end else '0')
     return ''.join(bits)
+
+
+def get_allowed_window(schedule: str, day: int) -> str:
+    """Get human-readable allowed hours for a given day from schedule string.
+
+    Returns e.g. "7:00 AM - 9:00 AM, 5:00 PM - 10:00 PM" or "none".
+    """
+    day_sched = schedule[day * 24:(day + 1) * 24]
+    ranges = []
+    start = None
+    for h in range(25):  # 25 to close trailing range at midnight
+        in_range = h < 24 and day_sched[h] == '1'
+        if in_range and start is None:
+            start = h
+        elif not in_range and start is not None:
+            ranges.append(f"{_fmt_hour(start)} - {_fmt_hour(h)}")
+            start = None
+    return ', '.join(ranges) if ranges else 'none'
+
+
+def _fmt_hour(h: int) -> str:
+    """Format hour as 12-hour time (e.g. 17 -> '5:00 PM')."""
+    if h == 0 or h == 24:
+        return '12:00 AM'
+    elif h == 12:
+        return '12:00 PM'
+    elif h < 12:
+        return f'{h}:00 AM'
+    else:
+        return f'{h - 12}:00 PM'
 
 
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
@@ -156,12 +189,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 user TEXT NOT NULL UNIQUE,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 daily_total INTEGER NOT NULL DEFAULT 180,  -- minutes
-                gaming_limit INTEGER NOT NULL DEFAULT 120,  -- minutes
-                weekday_start TEXT DEFAULT '16:00',
-                weekday_end TEXT DEFAULT '21:00',
-                weekend_start TEXT DEFAULT '09:00',
-                weekend_end TEXT DEFAULT '22:00',
-                schedule TEXT,  -- 168-char string: 7 days * 24 hours, '1'=allowed '0'=blocked
+                schedule TEXT NOT NULL DEFAULT '',  -- 168-char string: 7 days * 24 hours, '1'=allowed '0'=blocked
+                daily_limits TEXT NOT NULL DEFAULT '120,120,120,120,120,120,120',  -- per-day gaming limits (minutes)
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -392,19 +421,47 @@ def migrate_db(db_path: str = DEFAULT_DB_PATH) -> None:
         if 'schedule' not in ul_columns:
             conn.execute("ALTER TABLE user_limits ADD COLUMN schedule TEXT")
             # Migrate existing time ranges to schedule strings
-            rows = conn.execute(
-                "SELECT user, weekday_start, weekday_end, weekend_start, weekend_end FROM user_limits"
-            ).fetchall()
-            for row in rows:
-                sched = schedule_from_ranges(row[1], row[2], row[3], row[4])
-                conn.execute("UPDATE user_limits SET schedule = ? WHERE user = ?", (sched, row[0]))
+            has_legacy = 'weekday_start' in ul_columns
+            if has_legacy:
+                rows = conn.execute(
+                    "SELECT user, weekday_start, weekday_end, weekend_start, weekend_end FROM user_limits"
+                ).fetchall()
+                for row in rows:
+                    sched = schedule_from_ranges(row[1], row[2], row[3], row[4])
+                    conn.execute("UPDATE user_limits SET schedule = ? WHERE user = ?", (sched, row[0]))
 
         # Add daily_limits column to user_limits if not present
         if 'daily_limits' not in ul_columns:
             conn.execute("ALTER TABLE user_limits ADD COLUMN daily_limits TEXT")
             # Migrate: use existing gaming_limit for all 7 days
-            rows = conn.execute("SELECT user, gaming_limit FROM user_limits").fetchall()
-            for row in rows:
+            has_gaming_limit = 'gaming_limit' in ul_columns
+            if has_gaming_limit:
+                rows = conn.execute("SELECT user, gaming_limit FROM user_limits").fetchall()
+                for row in rows:
+                    gl = row[1] or 120
+                    dl = ','.join([str(gl)] * 7)
+                    conn.execute("UPDATE user_limits SET daily_limits = ? WHERE user = ?", (dl, row[0]))
+
+        # Backfill: ensure all users have schedule and daily_limits populated
+        # (handles case where columns exist but values are NULL)
+        has_legacy_cols = 'weekday_start' in ul_columns
+        if has_legacy_cols:
+            null_schedule = conn.execute(
+                "SELECT user, weekday_start, weekday_end, weekend_start, weekend_end "
+                "FROM user_limits WHERE schedule IS NULL OR schedule = ''"
+            ).fetchall()
+            for row in null_schedule:
+                sched = schedule_from_ranges(
+                    row[1] or '16:00', row[2] or '21:00',
+                    row[3] or '09:00', row[4] or '22:00')
+                conn.execute("UPDATE user_limits SET schedule = ? WHERE user = ?", (sched, row[0]))
+
+        has_gl_col = 'gaming_limit' in ul_columns
+        if has_gl_col:
+            null_dl = conn.execute(
+                "SELECT user, gaming_limit FROM user_limits WHERE daily_limits IS NULL OR daily_limits = ''"
+            ).fetchall()
+            for row in null_dl:
                 gl = row[1] or 120
                 dl = ','.join([str(gl)] * 7)
                 conn.execute("UPDATE user_limits SET daily_limits = ? WHERE user = ?", (dl, row[0]))
@@ -504,7 +561,7 @@ def _seed_default_templates(conn):
 
         # outside_hours - tried to play outside allowed hours
         ('outside_hours', 0, 'Outside gaming hours',
-         'Gaming is available from {start_time} to {end_time}. Come back later!',
+         'Gaming hours today: {allowed_window}. Come back later!',
          'dialog-information', 'normal'),
 
         # discovery - new process detected
@@ -1029,12 +1086,40 @@ class ActivityDB:
             return dict(row) if row else None
 
     def set_user_limits(self, user: str, **kwargs) -> int:
-        """Set or update user limits."""
+        """Set or update user limits.
+
+        Accepts modern columns directly (enabled, daily_total, schedule, daily_limits)
+        and legacy convenience kwargs that get converted:
+          - gaming_limit -> daily_limits (same value for all 7 days)
+          - weekday_start/end + weekend_start/end -> schedule string
+        """
         now = datetime.now().isoformat()
         existing = self.get_user_limits(user)
 
-        allowed = {'enabled', 'daily_total', 'gaming_limit',
-                   'weekday_start', 'weekday_end', 'weekend_start', 'weekend_end'}
+        # Convert legacy kwargs to modern columns
+        if 'gaming_limit' in kwargs:
+            gl = kwargs.pop('gaming_limit')
+            if 'daily_limits' not in kwargs:
+                kwargs['daily_limits'] = format_daily_limits([gl] * 7)
+
+        time_range_keys = {'weekday_start', 'weekday_end', 'weekend_start', 'weekend_end'}
+        time_ranges = {k: kwargs.pop(k) for k in time_range_keys if k in kwargs}
+        if time_ranges and 'schedule' not in kwargs:
+            # Fill in defaults for any missing range values
+            if existing:
+                # For existing users, only override the ranges that were passed
+                wd_s = time_ranges.get('weekday_start', '16:00')
+                wd_e = time_ranges.get('weekday_end', '21:00')
+                we_s = time_ranges.get('weekend_start', '09:00')
+                we_e = time_ranges.get('weekend_end', '22:00')
+            else:
+                wd_s = time_ranges.get('weekday_start', '16:00')
+                wd_e = time_ranges.get('weekday_end', '21:00')
+                we_s = time_ranges.get('weekend_start', '09:00')
+                we_e = time_ranges.get('weekend_end', '22:00')
+            kwargs['schedule'] = schedule_from_ranges(wd_s, wd_e, we_s, we_e)
+
+        allowed = {'enabled', 'daily_total', 'schedule', 'daily_limits'}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
 
         with get_connection(self.db_path) as conn:
@@ -1047,41 +1132,29 @@ class ActivityDB:
                 )
                 return existing['id']
             else:
-                conn.execute("""
-                    INSERT INTO user_limits
-                        (user, enabled, daily_total, gaming_limit,
-                         weekday_start, weekday_end, weekend_start, weekend_end,
-                         created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    user,
-                    updates.get('enabled', 1),
-                    updates.get('daily_total', 180),
-                    updates.get('gaming_limit', 120),
-                    updates.get('weekday_start', '16:00'),
-                    updates.get('weekday_end', '21:00'),
-                    updates.get('weekend_start', '09:00'),
-                    updates.get('weekend_end', '22:00'),
-                    now, now
-                ))
+                # New user: ensure schedule and daily_limits have values
+                updates.setdefault('schedule', schedule_from_ranges(
+                    '16:00', '21:00', '09:00', '22:00'))
+                updates.setdefault('daily_limits', DEFAULT_DAILY_LIMITS)
+                updates.setdefault('enabled', 1)
+                updates.setdefault('daily_total', 180)
+                updates['user'] = user
+                updates['created_at'] = now
+                updates['updated_at'] = now
+                columns = ', '.join(updates.keys())
+                placeholders = ', '.join('?' * len(updates))
+                conn.execute(
+                    f"INSERT INTO user_limits ({columns}) VALUES ({placeholders})",
+                    tuple(updates.values())
+                )
                 return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     def get_schedule(self, user: str) -> str:
-        """Get 168-char schedule string for user. Generates from time ranges if needed."""
+        """Get 168-char schedule string for user."""
         limits = self.get_user_limits(user)
         if not limits:
             return DEFAULT_SCHEDULE
-        if limits.get('schedule'):
-            return limits['schedule']
-        # Generate from legacy time range columns
-        sched = schedule_from_ranges(
-            limits.get('weekday_start', '00:00'),
-            limits.get('weekday_end', '23:59'),
-            limits.get('weekend_start', '00:00'),
-            limits.get('weekend_end', '23:59'),
-        )
-        self.set_schedule(user, sched)
-        return sched
+        return limits.get('schedule') or DEFAULT_SCHEDULE
 
     def set_schedule(self, user: str, schedule: str):
         """Write a 168-char schedule string."""
@@ -1100,9 +1173,7 @@ class ActivityDB:
         dl = limits.get('daily_limits')
         if dl:
             return parse_daily_limits(dl)
-        # Fall back to global gaming_limit for all days
-        gl = limits.get('gaming_limit', 120)
-        return [gl] * 7
+        return [120] * 7
 
     def set_daily_limits(self, user: str, daily_limits: list[int]):
         """Write per-day gaming limits (7 ints, Mon-Sun, in minutes)."""

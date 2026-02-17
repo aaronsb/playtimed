@@ -275,8 +275,7 @@ class TestTimeLimitEnforcement:
 
     def test_time_remaining_calculation(self, db):
         """Test calculating remaining time."""
-        limits = db.get_user_limits("anders")
-        gaming_limit_seconds = limits['gaming_limit'] * 60  # 120 min = 7200 sec
+        gaming_limit_seconds = db.get_daily_limits("anders")[0] * 60  # 120 min = 7200 sec
 
         # Use 60 minutes
         db.update_daily_summary("anders", gaming_seconds=3600, total_seconds=3600)
@@ -288,8 +287,7 @@ class TestTimeLimitEnforcement:
 
     def test_time_exhausted(self, db):
         """Test when time is fully used."""
-        limits = db.get_user_limits("anders")
-        gaming_limit_seconds = limits['gaming_limit'] * 60
+        gaming_limit_seconds = db.get_daily_limits("anders")[0] * 60
 
         # Use all time
         db.update_daily_summary("anders", gaming_seconds=gaming_limit_seconds,
@@ -302,8 +300,7 @@ class TestTimeLimitEnforcement:
 
     def test_over_limit_returns_zero_not_negative(self, db):
         """Test that going over limit returns 0, not negative."""
-        limits = db.get_user_limits("anders")
-        gaming_limit_seconds = limits['gaming_limit'] * 60
+        gaming_limit_seconds = db.get_daily_limits("anders")[0] * 60
 
         # Use more than limit (edge case)
         db.update_daily_summary("anders", gaming_seconds=gaming_limit_seconds + 600,
@@ -320,8 +317,7 @@ class TestWarningThresholds:
 
     def test_warning_needed_at_30_minutes(self, db):
         """Test that warning is needed at 30-minute threshold."""
-        limits = db.get_user_limits("anders")
-        gaming_limit_seconds = limits['gaming_limit'] * 60  # 7200 sec
+        gaming_limit_seconds = db.get_daily_limits("anders")[0] * 60  # 7200 sec
 
         # Use 90 minutes (30 remaining)
         db.update_daily_summary("anders", gaming_seconds=5400, total_seconds=5400)
@@ -340,8 +336,7 @@ class TestWarningThresholds:
 
     def test_warning_not_needed_if_already_warned(self, db):
         """Test that warning doesn't fire if already sent."""
-        limits = db.get_user_limits("anders")
-        gaming_limit_seconds = limits['gaming_limit'] * 60
+        gaming_limit_seconds = db.get_daily_limits("anders")[0] * 60
 
         # Use 90 minutes (30 remaining)
         db.update_daily_summary("anders", gaming_seconds=5400, total_seconds=5400)
@@ -358,8 +353,7 @@ class TestWarningThresholds:
 
     def test_multiple_thresholds_in_sequence(self, db):
         """Test warning flags set in sequence as time depletes."""
-        limits = db.get_user_limits("anders")
-        gaming_limit_seconds = limits['gaming_limit'] * 60
+        gaming_limit_seconds = db.get_daily_limits("anders")[0] * 60
 
         # Start fresh
         db.update_user_state("anders", gaming_active=1, warned_30=0, warned_15=0, warned_5=0)
