@@ -26,6 +26,10 @@ Interactive curses TUI for per-hour, per-day schedule control with paint mode an
 
 ![Schedule Editor](docs/media/2026-02-08_18-06.png)
 
+## Notifications
+
+![Outside gaming hours notification](docs/media/notification-outside-hours.png)
+
 ## Features
 
 - **Process monitoring** with CPU-based activity detection (idle launchers don't count)

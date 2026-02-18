@@ -1875,6 +1875,15 @@ def cmd_schedule_edit(args):
         curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)  # cursor
         curses.init_pair(4, curses.COLOR_YELLOW, -1)   # limit highlight
 
+        # Check terminal size — grid needs at least 112 cols × 21 rows
+        max_y, max_x = stdscr.getmaxyx()
+        if max_x < 112 or max_y < 21:
+            curses.endwin()
+            print(f"Terminal too small ({max_x}x{max_y}). "
+                  f"Schedule editor needs at least 112 columns and 21 rows.",
+                  file=sys.stderr)
+            return False
+
         cur_day = 0
         cur_hour = 0  # 0-23 = schedule hours, 24 = limit column
         painting = None  # None = not painting, '1' = painting allowed, '0' = painting blocked
