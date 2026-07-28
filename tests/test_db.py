@@ -416,3 +416,74 @@ class TestUserState:
         state = db.get_user_state('anders')
         assert state['warned_30'] == 1
         assert state['warned_15'] == 0
+
+
+class TestSessionReconciliation:
+    """Sessions left open by an unclean daemon exit."""
+
+    def test_get_open_sessions(self, db):
+        """Only sessions without an end_time are reported as open."""
+        open_id = db.start_session('anders', 'Minecraft', 'gaming', pid=111)
+        closed_id = db.start_session('anders', 'Factorio', 'gaming', pid=222)
+        db.end_session(session_id=closed_id, reason='natural')
+
+        open_sessions = db.get_open_sessions()
+        assert [s['id'] for s in open_sessions] == [open_id]
+
+    def test_get_open_sessions_filters_by_user(self, db):
+        db.start_session('anders', 'Minecraft', 'gaming', pid=111)
+        db.start_session('someone_else', 'Minecraft', 'gaming', pid=222)
+
+        assert len(db.get_open_sessions()) == 2
+        assert len(db.get_open_sessions(user='anders')) == 1
+
+    def test_close_session_records_duration(self, db):
+        """A known end time yields a measured duration."""
+        sid = db.start_session('anders', 'Minecraft', 'gaming', pid=111)
+        start = db.get_open_sessions()[0]['start_time']
+        end = datetime.fromisoformat(start).replace(microsecond=0)
+        end = end.replace(hour=(end.hour + 1) % 24).isoformat()
+
+        db.close_session(sid, end, 'shutdown')
+
+        assert db.get_open_sessions() == []
+        row = db.get_sessions_range('anders', days=1)[0]
+        assert row['end_reason'] == 'shutdown'
+        assert row['duration'] is not None
+
+    def test_close_session_unknown_duration_stays_null(self, db):
+        """An end time that is only an upper bound leaves duration NULL.
+
+        Inventing a duration here would credit playtime that may never have
+        happened, inflating per-app totals.
+        """
+        sid = db.start_session('anders', 'Minecraft', 'gaming', pid=111)
+        bound = db.get_open_sessions()[0]['start_time']
+
+        db.close_session(sid, bound, 'orphaned', duration_known=False)
+
+        row = db.get_sessions_range('anders', days=1)[0]
+        assert row['end_time'] is not None
+        assert row['end_reason'] == 'orphaned'
+        assert row['duration'] is None
+
+    def test_close_session_ignores_already_closed(self, db):
+        """Closing twice must not overwrite the original end reason."""
+        sid = db.start_session('anders', 'Minecraft', 'gaming', pid=111)
+        db.end_session(session_id=sid, reason='natural')
+
+        db.close_session(sid, datetime.now().isoformat(), 'orphaned',
+                         duration_known=False)
+
+        row = db.get_sessions_range('anders', days=1)[0]
+        assert row['end_reason'] == 'natural'
+
+    def test_get_last_poll_at(self, db):
+        """last_poll_at bounds how late an orphan could still have been running."""
+        from datetime import date
+        today = date.today().isoformat()
+        assert db.get_last_poll_at('anders', today) is None
+
+        stamp = datetime.now().isoformat()
+        db.update_user_state('anders', last_poll_at=stamp)
+        assert db.get_last_poll_at('anders', today) == stamp
