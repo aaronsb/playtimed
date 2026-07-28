@@ -5,6 +5,17 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-07-27
+
+### Fixed
+- **A global catch-all outranked user-scoped patterns** — process matching tested every gaming pattern before any launcher pattern, so the global `\.exe$` catch-all claimed Wine helper processes that were already classified as launchers. On a Wine-heavy host this tracked `explorer.exe`, `winedevice.exe`, `xalia.exe`, `svchost.exe` and friends as "Proton Game", one session apiece — a single afternoon of one game produced 37 helper sessions, burying the real game in the session log
+
+### Changed
+- Gaming and launcher patterns are now matched as one ordered set via `rank_patterns()`, ranked by specificity first and category second: a user-scoped pattern outranks a global one whatever its category, and within the same scope gaming still outranks launcher so a game misfiled as a launcher keeps counting
+
+### Note
+Reclassifying Wine helpers as launchers only takes effect on this release. On 0.5.2 and earlier the same reclassification made things worse, because the helpers then fell through to the `\.exe$` catch-all and were counted under a misleading name.
+
 ## [0.5.2] - 2026-07-27
 
 ### Fixed
