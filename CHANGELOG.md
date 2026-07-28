@@ -5,6 +5,44 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-07-27
+
+### Fixed
+- **Status total percentage read a dead column** — `playtimed status` computed the Total progress bar from the legacy `daily_total` column while Gaming used the current per-day limits, so a stale value could render nonsense (789% against a real 100%). Both now measure against `daily_limits`, completing the migration started in 0.5.1
+- **History coloured every row against a flat limit** — `playtimed history` compared each day's gaming time to the legacy `gaming_limit` column instead of that day's own budget, marking weekday rows red against a weekend allowance. Each row is now coloured against its own day's limit
+- **Warns column always showed 0** — `playtimed history` read the `warnings_sent` counter, which the daemon never increments; warnings are recorded as the `warned_30`/`warned_15`/`warned_5` flags. The column now derives its count from those flags
+- **Sessions leaked on unclean daemon exit** — active sessions are tracked in memory only, so a crash, reboot, or SIGKILL left rows with no `end_time` while the next poll opened fresh ones for the same processes. Open sessions are now closed on shutdown, and any left behind by a previous run are reconciled at startup
+
+### Added
+- `ActivityDB.get_open_sessions()`, `close_session()`, and `get_last_poll_at()` supporting session reconciliation
+- Sessions closed at an unverified upper bound record a NULL duration and display as `unknown` rather than being credited with playtime that may never have happened — they drop out of per-app aggregates instead of inflating them
+- `shutdown` and `orphaned` end reasons distinguish a clean daemon stop from a session recovered after an unclean exit
+
+## [0.5.1] - 2026-02-17
+
+### Fixed
+- **Schedule editor crashed on small terminals** — added a terminal size check before rendering the 7×24 grid
+- **Launcher misclassification** — high-CPU launcher processes are flagged as possibly misclassified games
+- **Gaming pattern priority** — a gaming pattern now takes precedence over a launcher pattern when both match a process
+
+### Changed
+- **Schedule string is the sole source of truth** — removed the legacy scheduling columns in favour of the 168-character schedule string and `daily_limits`
+
+## [0.5.0] - 2026-02-08
+
+### Added
+- **Per-day gaming limits** — each weekday carries its own budget via `daily_limits` instead of one flat number
+- **Termination audit** — `playtimed audit` reports process terminations over the last 30 days
+- **Creative category** — process patterns can be categorised as creative work, tracked separately from gaming
+
+## [0.4.0] - 2026-02-08
+
+### Added
+- **Per-hour schedule grid** — 168-character schedule string (7 days × 24 hours) controlling when gaming is permitted
+- **Interactive schedule editor** — `playtimed schedule` renders an editable 7×24 grid
+- **Activity heatmap** — `playtimed heatmap` visualises usage by hour and day
+- **CPU hysteresis** — smooths activity detection so brief CPU dips don't end a session prematurely
+
 ## [0.3.4] - 2026-02-07
 
 ### Added

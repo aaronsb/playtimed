@@ -1104,6 +1104,32 @@ class ClaudeDaemon:
                                    warned_15=warned_15,
                                    warned_5=warned_5)
 
+    def _reconcile_open_sessions(self):
+        """Close sessions left open by a previous run.
+
+        Active sessions are held in memory only, so anything still running when
+        the daemon exits uncleanly (crash, reboot, SIGKILL) leaves a row with no
+        end_time. Those processes are re-detected on the next poll and get fresh
+        sessions, so the stale rows would otherwise stay open forever.
+
+        Each is closed at the last time the daemon is known to have polled on
+        that date — the tightest defensible bound on when it was still observed
+        running. Crediting them up to *now* would invent hours or days of
+        playtime that never happened.
+        """
+        open_sessions = self.db.get_open_sessions()
+        if not open_sessions:
+            return
+
+        for s in open_sessions:
+            day = s['start_time'][:10]
+            bound = self.db.get_last_poll_at(s['user'], day)
+            if not bound or bound < s['start_time']:
+                bound = s['start_time']
+            self.db.close_session(s['id'], bound, "orphaned", duration_known=False)
+
+        log.info(f"Reconciled {len(open_sessions)} session(s) left open by a previous run")
+
     def run(self):
         """Main daemon loop."""
         log.info("playtimed starting up")
@@ -1117,6 +1143,8 @@ class ClaudeDaemon:
         self.db.cleanup_seen_pids(days=7)  # Clean old PID records
         log.info(f"Maintenance complete: deleted {maint['deleted']}, "
                  f"DB size: {maint['after']['file_size_mb']:.2f} MB")
+
+        self._reconcile_open_sessions()
 
         poll_interval = self.config["daemon"].get("poll_interval", 30)
 
@@ -1149,6 +1177,15 @@ class ClaudeDaemon:
         for user in self.users:
             self._save_user_state(user)
 
+        # Close sessions still open so they don't leak into the next run.
+        # We know these were alive as of right now, so "now" is the accurate end.
+        now_iso = datetime.now().isoformat()
+        closed = self.db.get_open_sessions()
+        for s in closed:
+            self.db.close_session(s['id'], now_iso, "shutdown")
+        if closed:
+            log.info(f"Closed {len(closed)} active session(s) on shutdown")
+
         log.info("playtimed shutdown complete")
 
 
@@ -1156,10 +1193,13 @@ def _get_user_status_row(db, user: str) -> dict:
     """Get status data for a single user."""
     total_used, gaming_used = db.get_time_used_today(user)
 
-    limits = db.get_user_limits(user)
+    # daily_limits is the sole source of truth for per-day budget (see 31011c3).
+    # Both gaming and total measure against today's allowance; total_time is the
+    # superset (all monitored activity), gaming_time the gaming subset of it.
     today_limits = db.get_daily_limits(user)
-    gaming_limit = today_limits[datetime.now().weekday()] * 60
-    total_limit = (limits['daily_total'] * 60) if limits else 180 * 60
+    day_limit = today_limits[datetime.now().weekday()] * 60
+    gaming_limit = day_limit
+    total_limit = day_limit
 
     gaming_remaining = max(0, gaming_limit - gaming_used)
     total_remaining = max(0, total_limit - total_used)
@@ -1337,8 +1377,7 @@ def cmd_history(args):
             print(f"No history for {u}")
             continue
 
-        limits = db.get_user_limits(u) or {}
-        gaming_limit = limits.get('gaming_limit', 0)
+        daily_limits = db.get_daily_limits(u)
 
         print(Colors.header(f"Screen Time History: {u}") + f" (last {days} days)")
         print()
@@ -1346,16 +1385,23 @@ def cmd_history(args):
         headers = ["Date", "Day", "Gaming", "Total", "Sessions", "Warns", "Kills"]
         rows = []
         for s in summaries:
-            day_name = datetime.fromisoformat(s['date']).strftime("%a") if s.get('date') else ""
+            day = datetime.fromisoformat(s['date']) if s.get('date') else None
+            day_name = day.strftime("%a") if day else ""
             gaming_mins = s.get('gaming_time', 0) // 60
-            total_mins = s.get('total_time', 0) // 60
 
-            # Color gaming time red if over limit
+            # Each row is coloured against that day's own limit — weekends and
+            # weekdays have different budgets, so a single flat number would
+            # mark every weekday row red.
+            day_limit = daily_limits[day.weekday()] if day else 0
             gaming_str = format_duration(s.get('gaming_time', 0))
-            if gaming_limit and gaming_mins > gaming_limit:
+            if day_limit and gaming_mins > day_limit:
                 gaming_str = Colors.error(gaming_str)
-            elif gaming_limit and gaming_mins > gaming_limit * 0.8:
+            elif day_limit and gaming_mins > day_limit * 0.8:
                 gaming_str = Colors.warn(gaming_str)
+
+            # The daemon records warnings as three separate flags; the
+            # warnings_sent counter is never incremented.
+            warns = sum(1 for f in ('warned_30', 'warned_15', 'warned_5') if s.get(f))
 
             rows.append([
                 s['date'],
@@ -1363,7 +1409,7 @@ def cmd_history(args):
                 gaming_str,
                 format_duration(s.get('total_time', 0)),
                 str(s.get('session_count', 0)),
-                str(s.get('warnings_sent', 0)),
+                str(warns),
                 str(s.get('enforcements', 0)),
             ])
 
@@ -1476,11 +1522,20 @@ def cmd_sessions(args):
             start_time = start
             start_date = ""
 
+        # Three distinct states: still running (no end recorded), closed with a
+        # measured duration, or closed at a bound we can't attribute a duration
+        # to (orphaned by an unclean daemon exit).
         duration = s.get('duration')
-        dur_str = format_duration(duration) if duration else Colors.dim("running")
+        if duration:
+            dur_str = format_duration(duration)
+        elif s.get('end_time'):
+            dur_str = Colors.dim("unknown")
+        else:
+            dur_str = Colors.dim("running")
 
         reason = s.get('end_reason', '')
         reason_map = {'natural': Colors.ok('exit'), 'enforced': Colors.error('killed'),
+                      'shutdown': Colors.dim('daemon stop'), 'orphaned': Colors.warn('orphaned'),
                       'unknown': Colors.dim('?')}
         reason_str = reason_map.get(reason, Colors.dim(reason or '-'))
 

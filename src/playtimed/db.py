@@ -669,6 +669,64 @@ class ActivityDB:
                     WHERE id = ?
                 """, (end_time, duration, reason, row['id']))
 
+    def get_open_sessions(self, user: str = None) -> list[dict]:
+        """Sessions with no recorded end (end_time IS NULL).
+
+        These accumulate whenever the daemon exits without closing them —
+        a crash, a reboot, or a SIGKILL.
+        """
+        sql = "SELECT * FROM sessions WHERE end_time IS NULL"
+        params = []
+        if user:
+            sql += " AND user = ?"
+            params.append(user)
+        sql += " ORDER BY start_time"
+
+        with get_connection(self.db_path) as conn:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    def close_session(self, session_id: int, end_time: str, reason: str,
+                      duration_known: bool = True):
+        """Close a session at an explicit end time.
+
+        Unlike end_session(), which assumes the session is ending *now*, this
+        takes the end time as a parameter so a session orphaned days ago can be
+        closed at a defensible historical timestamp rather than being credited
+        with all the wall-clock time since.
+
+        Set duration_known=False when end_time is only an upper bound rather
+        than an observation. Duration is then left NULL — the process may have
+        exited at any point before it, and inventing a number would inflate
+        per-app totals with playtime that never happened. SUM() skips NULLs,
+        so unknown sessions drop out of aggregates instead of skewing them.
+        """
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT start_time FROM sessions WHERE id = ? AND end_time IS NULL",
+                (session_id,)
+            ).fetchone()
+            if not row:
+                return
+
+            duration = None
+            if duration_known:
+                start = datetime.fromisoformat(row['start_time'])
+                duration = max(0, int((datetime.fromisoformat(end_time) - start).total_seconds()))
+            conn.execute("""
+                UPDATE sessions
+                SET end_time = ?, duration = ?, end_reason = ?
+                WHERE id = ?
+            """, (end_time, duration, reason, session_id))
+
+    def get_last_poll_at(self, user: str, day: str) -> Optional[str]:
+        """Last time the daemon polled on a given date, if recorded."""
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT last_poll_at FROM daily_summary WHERE user = ? AND date = ?",
+                (user, day)
+            ).fetchone()
+            return row['last_poll_at'] if row and row['last_poll_at'] else None
+
     def update_daily_summary(self, user: str, gaming_seconds: int = 0,
                              total_seconds: int = 0, warnings: int = 0,
                              enforcements: int = 0):
