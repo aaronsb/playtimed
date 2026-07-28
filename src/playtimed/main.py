@@ -275,6 +275,30 @@ def require_root(command: str):
         sys.exit(1)
 
 
+def rank_patterns(gaming_patterns: list[dict],
+                  launcher_patterns: list[dict]) -> list[dict]:
+    """Order gaming and launcher patterns into one match list.
+
+    Priority is *specificity* first, category second:
+
+    1. A pattern scoped to a user outranks a global one whatever its category.
+    2. Within the same scope, gaming outranks launcher, so a game misfiled as
+       a launcher still counts (see 844373a).
+
+    Matching every gaming pattern ahead of every launcher pattern instead let
+    the global ``\\.exe$`` catch-all swallow Wine helpers already classified as
+    launchers -- explorer.exe and friends were tracked as "Proton Game", one
+    session apiece, burying the real game in the session log.
+
+    The sort is stable, so the database's own ordering survives within a tier.
+    """
+    return sorted(
+        gaming_patterns + launcher_patterns,
+        key=lambda p: (0 if p.get("owner") else 1,
+                       0 if p.get("category") == "gaming" else 1)
+    )
+
+
 def format_duration(seconds: int) -> str:
     """Format seconds as human-readable duration."""
     if seconds < 60:
@@ -515,9 +539,9 @@ class ClaudeDaemon:
         matches = []
         prev_games = self.active_games.get(user, {})
 
-        # Get active patterns from database
         launcher_patterns = self.db.get_patterns(category="launcher", owner=user)
         gaming_patterns = self.db.get_patterns(category="gaming", owner=user)
+        ranked_patterns = rank_patterns(gaming_patterns, launcher_patterns)
 
         for proc in psutil.process_iter(['pid', 'name', 'username', 'cmdline']):
             try:
@@ -527,12 +551,11 @@ class ClaudeDaemon:
                 cmdline = ' '.join(proc.info.get('cmdline') or [])
                 proc_name = proc.info.get('name', '')
 
-                # Check gaming patterns first (takes priority over launcher)
-                pdef = self._match_process_to_pattern(proc_name, cmdline, gaming_patterns)
+                # Most specific pattern wins; its category decides what happens
+                pdef = self._match_process_to_pattern(proc_name, cmdline, ranked_patterns)
 
-                # Skip launchers only if NOT a gaming match
-                if not pdef and self._match_process_to_pattern(proc_name, cmdline, launcher_patterns):
-                    # High-CPU launcher is suspicious — likely a misclassified game
+                if pdef and pdef.get("category") == "launcher":
+                    # Launchers are detected but never tick the clock
                     try:
                         cpu = proc.cpu_percent(interval=0.1)
                     except psutil.NoSuchProcess:
