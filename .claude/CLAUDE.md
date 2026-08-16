@@ -126,3 +126,55 @@ Port clippy.js to a native KDE Plasma widget:
 This is supposed to be fun (for dad at least). The goal is helping Anders develop better habits, not creating an adversarial surveillance state. Keep the personality warm, the enforcement fair, and the Clippy animations plentiful.
 
 When Anders inevitably complains: "You can always come talk to me about adjusting the rules. Or you could touch grass. Either works."
+
+## Releasing
+
+`aaronsb/arch-repo` publishes this project. It reads `./PKGBUILD` from the
+default branch, builds it in a clean container, lints with namcap, signs, and
+pushes to the AUR (`playtimed`) and the `[aaronsb]` pacman repository.
+
+```bash
+make check                   # ruff, pytest, and the version this repo would release
+make package                 # clean-chroot build + namcap; fails on a namcap error
+make release                 # then tag, push, and cut the GitHub release
+```
+
+Nothing here talks to the AUR. There is no `aur` target and no publish script:
+two writers to one AUR ref is how a PKGBUILD and its `.SRCINFO` drift apart.
+
+### Fields arch-repo owns
+
+It overwrites all four before publishing, so a value set here is only wrong
+until it does. Do not maintain them, and do not commit a `.SRCINFO`.
+
+| Field | Where it really comes from |
+|---|---|
+| `pkgver` | the newest published GitHub release |
+| `pkgrel` | arch-repo's count of how many times it packaged that release |
+| `sha256sums` | computed from the release artifact |
+| `.SRCINFO` | regenerated at publish |
+
+This project's own version lives in `pyproject.toml`, and `make version`
+compares it against the tag.
+
+### A packaging fix needs no release
+
+Change the recipe on the default branch and push. arch-repo compares the
+rendered recipe against what it last published and ships the difference as a
+`pkgrel` bump — `0.5.3-1` becomes `0.5.3-2`, resetting to `-1` at the next real
+release. Do not cut a version for a change to packaging alone.
+
+### Check before you tag
+
+`make package` builds the recipe in a clean chroot and runs namcap. It builds
+from `HEAD` rather than the published archive, so it works before the release it
+precedes, and it fails on a namcap error — namcap exits 0 whether or not it
+found one.
+
+### `PKGBUILD-git` is not published
+
+This repository carries one, but no `playtimed-git` package exists on the AUR
+and none is being created. Leave it unonboarded; adding it means adding an AUR
+package to maintain, which is a decision rather than a tidy-up.
+
+The full contract: https://github.com/aaronsb/arch-repo/blob/main/docs/packaging-contract.md
