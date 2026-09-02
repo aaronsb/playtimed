@@ -12,6 +12,15 @@ RestartSec=10
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/playtimed
+# Browser managed-policy directories (ADR-003). ProtectSystem=strict makes all
+# of /etc read-only, so without these the daemon's policy writes fail EROFS and
+# the generated rules silently stop tracking the database. The '-' prefix means
+# a path that does not exist is not an error, so an absent browser is fine.
+ReadWritePaths=-/etc/opt/chrome
+ReadWritePaths=-/etc/opt/edge
+ReadWritePaths=-/etc/chromium
+ReadWritePaths=-/etc/brave
+ReadWritePaths=-/etc/firefox
 PrivateTmp=true
 NoNewPrivileges=false
 # Needs to be able to kill user processes and switch users for notifications

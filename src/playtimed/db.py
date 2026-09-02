@@ -895,15 +895,25 @@ class ActivityDB:
             return cursor.lastrowid
 
     def get_patterns(self, category: str = None, enabled_only: bool = True,
-                     include_all_states: bool = False, owner: str = None) -> list[dict]:
+                     include_all_states: bool = False, owner: str = None,
+                     pattern_type: str = 'process') -> list[dict]:
         """Get process patterns, optionally filtered.
 
         By default, only returns 'active' patterns. Set include_all_states=True
         to get patterns in any state.
+
+        Also defaults to process patterns only. A browser_domain row's pattern
+        is a hostname, not a process regex, and matching it against a process
+        cmdline kills whatever happens to contain that string. Pass
+        pattern_type=None only when the caller genuinely wants every type.
         """
         with get_connection(self.db_path) as conn:
             conditions = []
             params = []
+
+            if pattern_type:
+                conditions.append("pattern_type = ?")
+                params.append(pattern_type)
 
             if category:
                 conditions.append("category = ?")
@@ -960,7 +970,8 @@ class ActivityDB:
 
     def seed_default_patterns(self):
         """Seed database with default patterns if empty."""
-        existing = self.get_patterns(enabled_only=False, include_all_states=True)
+        existing = self.get_patterns(enabled_only=False, include_all_states=True,
+                                     pattern_type=None)
         if existing:
             return  # Already has patterns
 
@@ -1578,7 +1589,7 @@ class ActivityDB:
                              include_all_states: bool = False) -> list[dict]:
         """Get browser domain patterns."""
         with get_connection(self.db_path) as conn:
-            conditions = ["pattern_type = 'browser_domain'"]
+            conditions = ["pattern_type = 'browser_domain'", "enabled = 1"]
             params = []
 
             if not include_all_states:

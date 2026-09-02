@@ -5,6 +5,26 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-09-02
+
+### Fixed
+- **Strict mode admitted unreviewed discoveries** — the mode advertises "whitelist only", but the poll loop only reached the warn-then-kill path when a process matched no pattern at all. A process matching a pattern in `discovered` state — a row discovery created automatically the first time it crossed the CPU threshold — ran unchallenged. On a host that had been in `normal` mode for a while, that covered most of what a user actually launches, so switching to `strict` changed nothing for them. Admission is now an explicit allowlist of `active` and `ignored`
+- **`discover disallow` on a browser domain did nothing** — the CLI wrote `disallowed` to the row and printed "will be terminated on detection", but the kill path operates on PIDs and browser domains are handled in a separate block that only records runtime. A domain could sit disallowed indefinitely and remain reachable. ADR-001 listed this as a stretch goal; it was never built
+
+### Added
+- **Browser managed-policy generation** (ADR-003) — playtimed writes Chrome-family and Firefox policy files from its own `browser_domain` patterns, so the browser enforces at navigation time across every tab and window rather than playtimed reacting to whichever tab has focus. `normal` mode generates a blocklist from disallowed domains; `strict` generates an allowlist of permitted domains with everything else blocked; `passthrough` withdraws playtimed's rules
+- `playtimed browser-policy` shows what would be written, `--sync` writes it. Generation also runs at daemon startup, on SIGHUP, and after any CLI command that changes a domain's state or the daemon mode
+- For Chrome-family browsers playtimed writes exactly one file, `playtimed.json`, and never reads or overwrites others in the merged policy directory. Firefox has no such directory, so there playtimed owns the `policies.WebsiteFilter` key inside the shared `policies.json` and leaves the rest of the document intact
+- An `active` gaming-category domain is written into the blocklist rather than the allowlist. `active` means "counted against the limit", and playtimed cannot close a tab when a domain's budget expires — so on a host that had been tracking YouTube time, reading `active` as "permitted" would have generated an allowlist of exactly the sites a lockdown exists to block
+
+### Changed
+- `ActivityDB.get_patterns()` now returns only `pattern_type = 'process'` rows by default. A `browser_domain` pattern holds a hostname, but process matching is an unanchored regex search over process name and command line, so a domain row in that scan meant any process whose cmdline contained the string was treated as that pattern — and a disallowed one was killed. Pass `pattern_type=None` for every type
+- `get_browser_patterns()` now honours the `enabled` column, which it previously ignored
+- The systemd unit grants write access to each browser's configuration root under `/etc`. `ProtectSystem=strict` made all of `/etc` read-only, so daemon-side policy writes would have failed `EROFS` and been logged as a warning while the feature appeared to work
+
+### Note
+Chrome reloads managed policy on launch and periodically thereafter, not immediately. A domain disallowed while the browser is open stays reachable until it reloads — the process layer is instantaneous and the browser layer is not.
+
 ## [0.5.3] - 2026-07-27
 
 ### Fixed
