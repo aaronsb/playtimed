@@ -57,7 +57,8 @@ FIREFOX_OWNED_KEY = ('policies', 'WebsiteFilter')
 class PolicyTarget:
     """One policy file playtimed may write, for one installed browser."""
 
-    def __init__(self, family: str, path: str, renderer, merge_key: tuple = None):
+    def __init__(self, family: str, path: str, renderer,
+                 merge_key: tuple | None = None):
         self.family = family
         self.path = path
         # Callable(mode, permitted, blocked) -> policy body or None.
@@ -77,7 +78,7 @@ class PolicyPlan:
     """
 
     def __init__(self, path: str, content: dict | None, reason: str,
-                 merge_key: tuple = None):
+                 merge_key: tuple | None = None):
         self.path = path
         # None means "no policy applies" — playtimed's rules come out.
         self.content = content
@@ -190,9 +191,10 @@ def partition_domains(patterns: list[dict]) -> tuple[list[str], list[str]]:
         state = p.get('monitor_state')
         category = (p.get('category') or '').lower()
 
-        if state == 'disallowed':
-            blocked.append(domain)
-        elif state == 'active' and category in UNENFORCEABLE_BUDGET_CATEGORIES:
+        unenforceable_budget = (state == 'active'
+                                and category in UNENFORCEABLE_BUDGET_CATEGORIES)
+
+        if state == 'disallowed' or unenforceable_budget:
             blocked.append(domain)
         elif state in ('active', 'ignored'):
             permitted.append(domain)
@@ -249,8 +251,8 @@ def firefox_policy(mode: str, permitted: list[str], blocked: list[str]) -> dict 
     }
 
 
-def detect_targets(chrome_family: dict = None,
-                   firefox_family: dict = None) -> list[PolicyTarget]:
+def detect_targets(chrome_family: dict | None = None,
+                   firefox_family: dict | None = None) -> list[PolicyTarget]:
     """Find the policy files for browsers actually present on this system."""
     chrome_family = CHROME_FAMILY if chrome_family is None else chrome_family
     firefox_family = FIREFOX_FAMILY if firefox_family is None else firefox_family
@@ -278,7 +280,7 @@ def _browser_installed(policy_dir: str, commands: tuple) -> bool:
 
 
 def plan_policies(mode: str, patterns: list[dict],
-                  targets: list[PolicyTarget] = None) -> list[PolicyPlan]:
+                  targets: list[PolicyTarget] | None = None) -> list[PolicyPlan]:
     """Build the policy plan for every installed browser."""
     if targets is None:
         targets = detect_targets()

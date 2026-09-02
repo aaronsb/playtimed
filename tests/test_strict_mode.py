@@ -5,8 +5,6 @@ pattern states that whitelist actually contains, so a matched-but-unreviewed
 process cannot slip through on the strength of having a row in the table.
 """
 
-import pytest
-
 from playtimed.main import STRICT_ADMITTED_STATES, strict_admits
 
 
