@@ -18,7 +18,25 @@ help: ## List targets
 
 check: version lint test ## Everything CI would run
 
+# The ruff version is part of the gate, not incidental to it: the default rule
+# selection grows between minor releases, which is how this project reached 244
+# findings without a commit causing them. pyproject pins the range for anyone
+# installing .[dev], but `make check` runs whatever ruff is on PATH, so that is
+# what gets checked. Moving to a newer series is a deliberate act — bump this,
+# then clear whatever the new defaults surface.
+RUFF_SERIES := 0.16
+
 lint:
+	@command -v ruff >/dev/null || { echo "needs ruff $(RUFF_SERIES).x" >&2; exit 1; }
+	@v=$$(ruff --version | awk '{print $$2}'); \
+	  case "$$v" in \
+	    $(RUFF_SERIES).*) ;; \
+	    *) echo "ruff $$v on PATH, gate is calibrated for $(RUFF_SERIES).x." >&2; \
+	       echo "A different series changes the default rule set. Either use" >&2; \
+	       echo "$(RUFF_SERIES).x, or bump RUFF_SERIES here and in pyproject and" >&2; \
+	       echo "clear what the new defaults find." >&2; \
+	       exit 1;; \
+	  esac
 	ruff check src tests
 
 test:
