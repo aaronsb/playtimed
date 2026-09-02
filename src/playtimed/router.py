@@ -8,15 +8,15 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import ClassVar
 
 from .db import ActivityDB
 from .notify import (
-    NotificationDispatcher,
-    get_dispatcher,
+    URGENCY_CRITICAL,
     URGENCY_LOW,
     URGENCY_NORMAL,
-    URGENCY_CRITICAL,
+    NotificationDispatcher,
+    get_dispatcher,
 )
 
 log = logging.getLogger("playtimed.router")
@@ -66,7 +66,7 @@ class MessageRouter:
     """
 
     # Map urgency strings to constants
-    URGENCY_MAP = {
+    URGENCY_MAP: ClassVar[dict[str, int]] = {
         'low': URGENCY_LOW,
         'normal': URGENCY_NORMAL,
         'critical': URGENCY_CRITICAL,
@@ -204,7 +204,7 @@ class MessageRouter:
 
         return notification_id, backend
 
-    def _log_message(self, user: str, intention: str, template_id: Optional[int],
+    def _log_message(self, user: str, intention: str, template_id: int | None,
                      rendered_title: str, rendered_body: str,
                      notification_id: int, backend: str):
         """Log message to database."""
@@ -327,7 +327,7 @@ class MessageRouter:
 
 
 # Module-level singleton
-_router: Optional[MessageRouter] = None
+_router: MessageRouter | None = None
 
 
 def get_router(db: ActivityDB = None) -> MessageRouter:

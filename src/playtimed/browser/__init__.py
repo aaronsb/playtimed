@@ -20,11 +20,10 @@ Public API:
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
-from .base import BrowserTab, BrowserWorker, SITE_SIGNATURES, is_excluded_domain
-from .detection import get_window_titles
+from .base import SITE_SIGNATURES, BrowserTab, BrowserWorker, is_excluded_domain
 from .chrome import ChromeWorker
+from .detection import get_window_titles
 from .firefox import FirefoxWorker
 
 log = logging.getLogger(__name__)
@@ -45,7 +44,7 @@ class BrowserWindow:
     """
     title: str
     browser: str  # 'chrome', 'firefox', etc.
-    domain: Optional[str]  # None if domain couldn't be extracted
+    domain: str | None  # None if domain couldn't be extracted
 
 
 def get_browser_domains_for_user(uid: int) -> list[BrowserWindow]:
@@ -138,7 +137,7 @@ BROWSER_SUFFIXES = [
 ]
 
 
-def extract_domain_from_title(title: str) -> tuple[Optional[str], Optional[str]]:
+def extract_domain_from_title(title: str) -> tuple[str | None, str | None]:
     """
     Extract domain and browser from window title.
 
@@ -273,26 +272,22 @@ class BrowserMonitor:
 
 
 __all__ = [
+    'BROWSER_SUFFIXES',
+    # Constants
+    'SITE_SIGNATURES',
+    'BrowserMonitor',
+    'BrowserTab',
     # Core types
     'BrowserWindow',
-    'BrowserTab',
     'BrowserWorker',
-    'BrowserMonitor',
-
     # Workers
     'ChromeWorker',
     'FirefoxWorker',
-
+    'extract_domain_from_title',
+    'get_active_domains',
     # Functions
     'get_browser_domains_for_user',
-    'get_active_domains',
-    'extract_domain_from_title',
     'get_window_titles',
-
-    # Constants
-    'SITE_SIGNATURES',
-    'BROWSER_SUFFIXES',
-
     # Filtering
     'is_excluded_domain',
 ]
