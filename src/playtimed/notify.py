@@ -8,7 +8,7 @@ Provides a NotificationBackend abstraction with priority-based fallback:
 """
 
 import logging
-from typing import Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 log = logging.getLogger("playtimed.notify")
 
@@ -26,7 +26,7 @@ import pwd
 import subprocess
 
 
-def get_user_bus_address(username: str) -> Optional[str]:
+def get_user_bus_address(username: str) -> str | None:
     """
     Get the D-Bus session bus address for a specific user.
 
@@ -161,7 +161,8 @@ class NotifySendBackend:
                 env={
                     "XDG_RUNTIME_DIR": f"/run/user/{self._uid}",
                     "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{self._uid}/bus",
-                }
+                },
+                check=False,
             )
             if result.returncode == 0:
                 log.debug(f"Sent notification to {self.username}: {title}")
@@ -292,7 +293,7 @@ class FreedesktopBackend:
     DBUS_PATH = "/org/freedesktop/Notifications"
     DBUS_INTERFACE = "org.freedesktop.Notifications"
 
-    def __init__(self, app_name: str = "playtimed", bus_address: Optional[str] = None):
+    def __init__(self, app_name: str = "playtimed", bus_address: str | None = None):
         self.app_name = app_name
         self._bus_address = bus_address
         self._bus = None
@@ -347,7 +348,7 @@ class FreedesktopBackend:
         return self._available
 
     @property
-    def server_name(self) -> Optional[str]:
+    def server_name(self) -> str | None:
         """Get the notification server name (e.g., 'Plasma', 'notify-osd')."""
         return self._server_name
 
@@ -435,11 +436,11 @@ class NotificationDispatcher:
             FreedesktopBackend(app_name),
             LogOnlyBackend(),
         ]
-        self._last_backend: Optional[str] = None
+        self._last_backend: str | None = None
         # Cache of user-specific backends: username -> NotifySendBackend
         self._user_backends: dict[str, NotifySendBackend] = {}
 
-    def _get_user_backend(self, username: str) -> Optional[NotifySendBackend]:
+    def _get_user_backend(self, username: str) -> NotifySendBackend | None:
         """Get or create a backend for sending notifications to a specific user."""
         if username in self._user_backends:
             backend = self._user_backends[username]
@@ -458,7 +459,7 @@ class NotificationDispatcher:
         return None
 
     @property
-    def available_backend(self) -> Optional[NotificationBackend]:
+    def available_backend(self) -> NotificationBackend | None:
         """Get the first available backend."""
         for backend in self.backends:
             if backend.is_available():
@@ -479,7 +480,7 @@ class NotificationDispatcher:
         icon: str = "dialog-information",
         replaces_id: int = 0,
         timeout: int = -1,
-        target_user: Optional[str] = None,
+        target_user: str | None = None,
     ) -> tuple[int, str]:
         """
         Send notification through first available backend.
@@ -533,7 +534,7 @@ class NotificationDispatcher:
 
 
 # Module-level singleton
-_dispatcher: Optional[NotificationDispatcher] = None
+_dispatcher: NotificationDispatcher | None = None
 
 
 def get_dispatcher() -> NotificationDispatcher:

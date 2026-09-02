@@ -12,7 +12,6 @@ import os
 import pwd
 import re
 import subprocess
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +51,7 @@ def get_window_titles(uid: int) -> list[tuple[str, str]]:
             ['sudo', '-u', username, '--preserve-env=DBUS_SESSION_BUS_ADDRESS',
              'qdbus6', '--literal', 'org.kde.KWin', '/WindowsRunner',
              'org.kde.krunner1.Match', ''],
-            capture_output=True, text=True, timeout=5, env=env
+            capture_output=True, text=True, timeout=5, env=env, check=False
         )
 
         if result.returncode != 0:
@@ -129,7 +128,7 @@ def get_window_icon_names(uid: int) -> dict[str, str]:
             ['sudo', '-u', username, '--preserve-env=DBUS_SESSION_BUS_ADDRESS',
              'qdbus6', '--literal', 'org.kde.KWin', '/WindowsRunner',
              'org.kde.krunner1.Match', ''],
-            capture_output=True, text=True, timeout=5, env=env
+            capture_output=True, text=True, timeout=5, env=env, check=False
         )
 
         if result.returncode != 0:

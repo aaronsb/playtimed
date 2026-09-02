@@ -6,9 +6,8 @@ Stores structured activity data for long-term metrics and analytics.
 
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 DEFAULT_DB_PATH = "/var/lib/playtimed/playtimed.db"
 
@@ -621,8 +620,8 @@ class ActivityDB:
         init_db(db_path)
         migrate_db(db_path)
 
-    def log_event(self, user: str, event_type: str, app: str = None,
-                  category: str = None, details: str = None, pid: int = None):
+    def log_event(self, user: str, event_type: str, app: str | None = None,
+                  category: str | None = None, details: str | None = None, pid: int | None = None):
         """Log an activity event."""
         with get_connection(self.db_path) as conn:
             conn.execute("""
@@ -630,8 +629,8 @@ class ActivityDB:
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (datetime.now().isoformat(), user, event_type, app, category, details, pid))
 
-    def start_session(self, user: str, app: str, category: str = None,
-                      pid: int = None) -> int:
+    def start_session(self, user: str, app: str, category: str | None = None,
+                      pid: int | None = None) -> int:
         """Record session start, return session ID."""
         with get_connection(self.db_path) as conn:
             cursor = conn.execute("""
@@ -640,8 +639,8 @@ class ActivityDB:
             """, (user, app, category, pid, datetime.now().isoformat()))
             return cursor.lastrowid
 
-    def end_session(self, session_id: int = None, pid: int = None,
-                    user: str = None, reason: str = "unknown"):
+    def end_session(self, session_id: int | None = None, pid: int | None = None,
+                    user: str | None = None, reason: str = "unknown"):
         """Record session end by session_id or by pid+user."""
         end_time = datetime.now().isoformat()
 
@@ -669,7 +668,7 @@ class ActivityDB:
                     WHERE id = ?
                 """, (end_time, duration, reason, row['id']))
 
-    def get_open_sessions(self, user: str = None) -> list[dict]:
+    def get_open_sessions(self, user: str | None = None) -> list[dict]:
         """Sessions with no recorded end (end_time IS NULL).
 
         These accumulate whenever the daemon exits without closing them —
@@ -718,7 +717,7 @@ class ActivityDB:
                 WHERE id = ?
             """, (end_time, duration, reason, session_id))
 
-    def get_last_poll_at(self, user: str, day: str) -> Optional[str]:
+    def get_last_poll_at(self, user: str, day: str) -> str | None:
         """Last time the daemon polled on a given date, if recorded."""
         with get_connection(self.db_path) as conn:
             row = conn.execute(
@@ -783,7 +782,7 @@ class ActivityDB:
                     session_count = session_count + 1
             """, (today, user))
 
-    def get_daily_summary(self, user: str, day: str = None) -> Optional[dict]:
+    def get_daily_summary(self, user: str, day: str | None = None) -> dict | None:
         """Get daily summary for user."""
         if day is None:
             day = date.today().isoformat()
@@ -857,7 +856,7 @@ class ActivityDB:
             """, (user, limit)).fetchall()
             return [dict(row) for row in rows]
 
-    def get_sessions_for_day(self, user: str, day: str = None) -> list[dict]:
+    def get_sessions_for_day(self, user: str, day: str | None = None) -> list[dict]:
         """Get all sessions for a specific day."""
         if day is None:
             day = date.today().isoformat()
@@ -880,8 +879,8 @@ class ActivityDB:
     # --- Process Pattern Management ---
 
     def add_pattern(self, pattern: str, name: str, category: str,
-                    cpu_threshold: float = 5.0, notes: str = None,
-                    owner: str = None, monitor_state: str = 'active') -> int:
+                    cpu_threshold: float = 5.0, notes: str | None = None,
+                    owner: str | None = None, monitor_state: str = 'active') -> int:
         """Add a new process pattern."""
         now = datetime.now().isoformat()
         with get_connection(self.db_path) as conn:
@@ -894,8 +893,8 @@ class ActivityDB:
                   cpu_threshold, notes, now, now))
             return cursor.lastrowid
 
-    def get_patterns(self, category: str = None, enabled_only: bool = True,
-                     include_all_states: bool = False, owner: str = None,
+    def get_patterns(self, category: str | None = None, enabled_only: bool = True,
+                     include_all_states: bool = False, owner: str | None = None,
                      pattern_type: str = 'process') -> list[dict]:
         """Get process patterns, optionally filtered.
 
@@ -955,7 +954,7 @@ class ActivityDB:
             return
 
         updates['updated_at'] = datetime.now().isoformat()
-        set_clause = ', '.join(f"{k} = ?" for k in updates.keys())
+        set_clause = ', '.join(f"{k} = ?" for k in updates)
 
         with get_connection(self.db_path) as conn:
             conn.execute(
@@ -1043,8 +1042,8 @@ class ActivityDB:
         self.set_daemon_config('mode', mode)
 
     def discover_pattern(self, pattern: str, name: str, owner: str,
-                         cmdline: str = None, cpu_threshold: float = 5.0,
-                         category: str = None, state: str = 'discovered') -> int:
+                         cmdline: str | None = None, cpu_threshold: float = 5.0,
+                         category: str | None = None, state: str = 'discovered') -> int:
         """Create a new discovered pattern."""
         now = datetime.now().isoformat()
         with get_connection(self.db_path) as conn:
@@ -1056,7 +1055,7 @@ class ActivityDB:
             """, (pattern, name, category, state, owner, cpu_threshold, cmdline, now, now, now))
             return cursor.lastrowid
 
-    def get_pattern_by_name_and_owner(self, name: str, owner: str) -> Optional[dict]:
+    def get_pattern_by_name_and_owner(self, name: str, owner: str) -> dict | None:
         """Find a pattern by name and owner (for discovery dedup)."""
         with get_connection(self.db_path) as conn:
             row = conn.execute("""
@@ -1065,7 +1064,7 @@ class ActivityDB:
             """, (name, owner)).fetchone()
             return dict(row) if row else None
 
-    def get_patterns_by_state(self, state: str, owner: str = None) -> list[dict]:
+    def get_patterns_by_state(self, state: str, owner: str | None = None) -> list[dict]:
         """Get patterns filtered by monitor_state."""
         with get_connection(self.db_path) as conn:
             if owner:
@@ -1083,7 +1082,7 @@ class ActivityDB:
             return [dict(row) for row in rows]
 
     def set_pattern_state(self, pattern_id: int, state: str,
-                          category: str = None, name: str = None):
+                          category: str | None = None, name: str | None = None):
         """Change a pattern's monitor state (promote, ignore, disallow)."""
         now = datetime.now().isoformat()
         with get_connection(self.db_path) as conn:
@@ -1146,7 +1145,7 @@ class ActivityDB:
 
     # --- User Limits Management ---
 
-    def get_user_limits(self, user: str) -> Optional[dict]:
+    def get_user_limits(self, user: str) -> dict | None:
         """Get limits for a user."""
         with get_connection(self.db_path) as conn:
             row = conn.execute("""
@@ -1194,7 +1193,7 @@ class ActivityDB:
         with get_connection(self.db_path) as conn:
             if existing:
                 updates['updated_at'] = now
-                set_clause = ', '.join(f"{k} = ?" for k in updates.keys())
+                set_clause = ', '.join(f"{k} = ?" for k in updates)
                 conn.execute(
                     f"UPDATE user_limits SET {set_clause} WHERE user = ?",
                     (*updates.values(), user)
@@ -1377,7 +1376,7 @@ class ActivityDB:
                 WHERE id = ?
             """, (notes, now, pattern_id))
 
-    def get_pattern_by_id(self, pattern_id: int) -> Optional[dict]:
+    def get_pattern_by_id(self, pattern_id: int) -> dict | None:
         """Get a pattern by ID."""
         with get_connection(self.db_path) as conn:
             row = conn.execute(
@@ -1404,7 +1403,7 @@ class ActivityDB:
                 """, (intention,)).fetchall()
             return [dict(row) for row in rows]
 
-    def get_template(self, intention: str, variant: int = 0) -> Optional[dict]:
+    def get_template(self, intention: str, variant: int = 0) -> dict | None:
         """Get a specific template by intention and variant."""
         with get_connection(self.db_path) as conn:
             row = conn.execute("""
@@ -1413,7 +1412,7 @@ class ActivityDB:
             """, (intention, variant)).fetchone()
             return dict(row) if row else None
 
-    def get_random_template(self, intention: str) -> Optional[dict]:
+    def get_random_template(self, intention: str) -> dict | None:
         """Get a random enabled template for an intention."""
         with get_connection(self.db_path) as conn:
             row = conn.execute("""
@@ -1434,7 +1433,7 @@ class ActivityDB:
             return [dict(row) for row in rows]
 
     def add_template(self, intention: str, title: str, body: str,
-                     variant: int = None, icon: str = "dialog-information",
+                     variant: int | None = None, icon: str = "dialog-information",
                      urgency: str = "normal") -> int:
         """Add a new message template."""
         now = datetime.now().isoformat()
@@ -1462,7 +1461,7 @@ class ActivityDB:
         if not updates:
             return
 
-        set_clause = ', '.join(f"{k} = ?" for k in updates.keys())
+        set_clause = ', '.join(f"{k} = ?" for k in updates)
         with get_connection(self.db_path) as conn:
             conn.execute(
                 f"UPDATE message_templates SET {set_clause} WHERE id = ?",
@@ -1478,7 +1477,7 @@ class ActivityDB:
 
     def log_message(self, user: str, intention: str, template_id: int,
                     rendered_title: str, rendered_body: str,
-                    notification_id: int = 0, backend: str = None) -> int:
+                    notification_id: int = 0, backend: str | None = None) -> int:
         """Log a sent message."""
         now = datetime.now().isoformat()
         with get_connection(self.db_path) as conn:
@@ -1491,7 +1490,7 @@ class ActivityDB:
                   rendered_title, rendered_body, notification_id, backend))
             return cursor.lastrowid
 
-    def get_recent_messages(self, user: str = None, limit: int = 50) -> list[dict]:
+    def get_recent_messages(self, user: str | None = None, limit: int = 50) -> list[dict]:
         """Get recent message log entries."""
         with get_connection(self.db_path) as conn:
             if user:
@@ -1521,7 +1520,7 @@ class ActivityDB:
 
     # --- User State (for message router) ---
 
-    def get_user_state(self, user: str) -> Optional[dict]:
+    def get_user_state(self, user: str) -> dict | None:
         """Get current user state from daily_summary."""
         today = date.today().isoformat()
         with get_connection(self.db_path) as conn:
@@ -1553,7 +1552,7 @@ class ActivityDB:
             """, (user, today)).fetchone()
 
             if exists:
-                set_clause = ', '.join(f"{k} = ?" for k in updates.keys())
+                set_clause = ', '.join(f"{k} = ?" for k in updates)
                 conn.execute(
                     f"UPDATE daily_summary SET {set_clause} WHERE user = ? AND date = ?",
                     (*updates.values(), user, today)
@@ -1572,7 +1571,7 @@ class ActivityDB:
     # --- Browser Patterns ---
 
     def add_browser_pattern(self, domain: str, name: str, category: str,
-                            browser: str, owner: str = None,
+                            browser: str, owner: str | None = None,
                             monitor_state: str = 'active') -> int:
         """Add a browser domain pattern."""
         now = datetime.now().isoformat()
@@ -1585,7 +1584,7 @@ class ActivityDB:
             """, (domain, name, category, browser, monitor_state, owner, now, now))
             return cursor.lastrowid
 
-    def get_browser_patterns(self, owner: str = None,
+    def get_browser_patterns(self, owner: str | None = None,
                              include_all_states: bool = False) -> list[dict]:
         """Get browser domain patterns."""
         with get_connection(self.db_path) as conn:
@@ -1606,7 +1605,7 @@ class ActivityDB:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def get_pattern_by_domain_and_owner(self, domain: str, owner: str) -> Optional[dict]:
+    def get_pattern_by_domain_and_owner(self, domain: str, owner: str) -> dict | None:
         """Find a browser pattern by domain and owner."""
         with get_connection(self.db_path) as conn:
             row = conn.execute("""

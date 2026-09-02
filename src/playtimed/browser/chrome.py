@@ -6,21 +6,17 @@ Uses window title parsing with Chrome history DB fallback for domain resolution.
 """
 
 import logging
-import os
 import pwd
 import re
-import shutil
 import sqlite3
 import subprocess
-import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 
 import psutil
 
-from .base import BrowserWorker, BrowserTab, SITE_SIGNATURES, is_excluded_domain
+from .base import BrowserTab, BrowserWorker, copy_locked_db, is_excluded_domain
 
 log = logging.getLogger(__name__)
 
@@ -129,7 +125,7 @@ class ChromeWorker(BrowserWorker):
 
         return tabs
 
-    def resolve_domain(self, uid: int, title: str) -> Optional[str]:
+    def resolve_domain(self, uid: int, title: str) -> str | None:
         """
         Resolve title to domain via Chrome history DB.
 
@@ -137,7 +133,6 @@ class ChromeWorker(BrowserWorker):
         matching page titles.
         """
         try:
-            username = pwd.getpwuid(uid).pw_name
             home = Path(pwd.getpwuid(uid).pw_dir)
         except KeyError:
             return None
@@ -157,7 +152,7 @@ class ChromeWorker(BrowserWorker):
 
         return None
 
-    def _lookup_in_history(self, history_path: Path, title: str) -> Optional[str]:
+    def _lookup_in_history(self, history_path: Path, title: str) -> str | None:
         """
         Look up title in Chrome history DB.
 
@@ -166,8 +161,7 @@ class ChromeWorker(BrowserWorker):
         temp_db = None
         try:
             # Copy to temp file (Chrome locks the original)
-            temp_db = Path(tempfile.mktemp(suffix='.db'))
-            shutil.copy2(history_path, temp_db)
+            temp_db = copy_locked_db(history_path)
 
             conn = sqlite3.connect(temp_db)
 
@@ -224,8 +218,7 @@ class ChromeWorker(BrowserWorker):
 
             temp_db = None
             try:
-                temp_db = Path(tempfile.mktemp(suffix='.db'))
-                shutil.copy2(history_path, temp_db)
+                temp_db = copy_locked_db(history_path)
 
                 conn = sqlite3.connect(temp_db)
                 cursor = conn.execute("""
@@ -281,7 +274,7 @@ class ChromeWorker(BrowserWorker):
 
         urls = []
 
-        for browser_id, profile_subpath in CHROME_PROFILE_PATHS.items():
+        for profile_subpath in CHROME_PROFILE_PATHS.values():
             sessions_dir = home / profile_subpath / 'Default' / 'Sessions'
 
             if not sessions_dir.exists():
@@ -303,7 +296,7 @@ class ChromeWorker(BrowserWorker):
                 # Use strings to extract URLs from binary SNSS format
                 result = subprocess.run(
                     ['strings', str(latest_session)],
-                    capture_output=True, text=True, timeout=5
+                    capture_output=True, text=True, timeout=5, check=False
                 )
 
                 if result.returncode == 0:

@@ -1,7 +1,6 @@
 """Tests for browser domain detection."""
 
-import pytest
-from playtimed.browser import extract_domain_from_title, SITE_SIGNATURES
+from playtimed.browser import SITE_SIGNATURES, extract_domain_from_title
 
 
 class TestExtractDomainFromTitle:
@@ -106,7 +105,7 @@ class TestExtractDomainFromTitle:
     def test_youtube_music_preferred_over_youtube(self):
         """YouTube Music should match before YouTube."""
         # This tests that longer signatures are checked first
-        domain, browser = extract_domain_from_title(
+        domain, _browser = extract_domain_from_title(
             "Song Title - YouTube Music - Google Chrome"
         )
         assert domain == "music.youtube.com"

@@ -6,7 +6,7 @@ from datetime import datetime
 
 import pytest
 
-from playtimed.db import ActivityDB, init_db, migrate_db
+from playtimed.db import ActivityDB, migrate_db
 
 
 @pytest.fixture
@@ -48,6 +48,7 @@ class TestPatternManagement:
             category="gaming",
             owner="anders"
         )
+        assert pattern_id > 0
 
         patterns = db.get_patterns(owner="anders")
         assert len(patterns) == 1
@@ -92,6 +93,7 @@ class TestDiscovery:
 
         patterns = db.get_patterns_by_state('discovered')
         assert len(patterns) == 1
+        assert patterns[0]['id'] == pattern_id
         assert patterns[0]['name'] == "New Game"
         assert patterns[0]['owner'] == "anders"
         assert patterns[0]['discovered_cmdline'] == "/usr/bin/newgame --fullscreen"

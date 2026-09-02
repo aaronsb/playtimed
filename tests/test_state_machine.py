@@ -142,19 +142,19 @@ class TestTimestampBasedTimeTracking:
         # Start with 0 time
         db.update_daily_summary("anders", gaming_seconds=0, total_seconds=0)
 
-        total, gaming = db.get_time_used_today("anders")
+        _total, gaming = db.get_time_used_today("anders")
         assert gaming == 0
 
         # Add 60 seconds
         db.update_daily_summary("anders", gaming_seconds=60, total_seconds=60)
 
-        total, gaming = db.get_time_used_today("anders")
+        _total, gaming = db.get_time_used_today("anders")
         assert gaming == 60
 
         # Add another 30 seconds
         db.update_daily_summary("anders", gaming_seconds=30, total_seconds=30)
 
-        total, gaming = db.get_time_used_today("anders")
+        _total, gaming = db.get_time_used_today("anders")
         assert gaming == 90
 
 
@@ -280,7 +280,7 @@ class TestTimeLimitEnforcement:
         # Use 60 minutes
         db.update_daily_summary("anders", gaming_seconds=3600, total_seconds=3600)
 
-        total_used, gaming_used = db.get_time_used_today("anders")
+        _total_used, gaming_used = db.get_time_used_today("anders")
         remaining = gaming_limit_seconds - gaming_used
 
         assert remaining == 3600  # 60 minutes remaining
@@ -293,7 +293,7 @@ class TestTimeLimitEnforcement:
         db.update_daily_summary("anders", gaming_seconds=gaming_limit_seconds,
                                  total_seconds=gaming_limit_seconds)
 
-        total_used, gaming_used = db.get_time_used_today("anders")
+        _total_used, gaming_used = db.get_time_used_today("anders")
         remaining = max(0, gaming_limit_seconds - gaming_used)
 
         assert remaining == 0
@@ -306,7 +306,7 @@ class TestTimeLimitEnforcement:
         db.update_daily_summary("anders", gaming_seconds=gaming_limit_seconds + 600,
                                  total_seconds=gaming_limit_seconds + 600)
 
-        total_used, gaming_used = db.get_time_used_today("anders")
+        _total_used, gaming_used = db.get_time_used_today("anders")
         remaining = max(0, gaming_limit_seconds - gaming_used)
 
         assert remaining == 0  # Not negative
@@ -322,7 +322,7 @@ class TestWarningThresholds:
         # Use 90 minutes (30 remaining)
         db.update_daily_summary("anders", gaming_seconds=5400, total_seconds=5400)
 
-        total_used, gaming_used = db.get_time_used_today("anders")
+        _total_used, gaming_used = db.get_time_used_today("anders")
         remaining_mins = (gaming_limit_seconds - gaming_used) // 60
 
         assert remaining_mins == 30
@@ -345,7 +345,7 @@ class TestWarningThresholds:
         db.update_user_state("anders", gaming_active=1, warned_30=1)
         state = db.get_user_state("anders")
 
-        total_used, gaming_used = db.get_time_used_today("anders")
+        _total_used, gaming_used = db.get_time_used_today("anders")
         remaining_mins = (gaming_limit_seconds - gaming_used) // 60
 
         should_warn_30 = remaining_mins <= 30 and not state['warned_30']

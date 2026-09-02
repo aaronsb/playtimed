@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_browser_patterns()` now honours the `enabled` column, which it previously ignored
 - The systemd unit grants write access to each browser's configuration root under `/etc`. `ProtectSystem=strict` made all of `/etc` read-only, so daemon-side policy writes would have failed `EROFS` and been logged as a warning while the feature appeared to work
 
+### Security
+- **Browser database copies used `tempfile.mktemp()`** — the workers copy Chrome's `History` and Firefox's `places.sqlite` somewhere unlocked before reading them, and `mktemp` returns a path without creating it. The daemon runs as root, the source is a file the monitored user owns and controls the contents of, and `/tmp` is world-writable, so that user could plant a symlink at the predicted path and have root write bytes of their choosing to a path of their choosing. `PrivateTmp=true` in the unit blocks it for the packaged daemon; `playtimed run` started by hand is not covered. Both workers now call one helper in `browser/base.py`, built on `mkstemp`, which creates the file itself with mode 0600. The helper removes the file if the copy raises: the caller has no name for it until the helper returns, so nothing else can — and a directory left at the profile path satisfies the caller's `.exists()` guard, making the copy fail on every poll
+- The content goes through the descriptor `mkstemp` returned rather than being written back by path. A write by name follows a symlink at the destination and carries no `O_EXCL`, so reopening would have reopened the same question, leaving only `/tmp`'s sticky bit between root and a user-directed write
+- The copy is a descriptor write rather than `shutil.copy2`. Browsers leave those profile files world-readable, and `copy2` would preserve the source mode — widening the 0600 back out and exposing the user's browsing history to every local account for as long as the copy exists
+
+### Changed
+- `make check` passes. It never had: ruff's default rule selection grows between minor releases, so the gate went red on code no commit touched, reaching 244 findings. ruff is now pinned in the dev extra, three rule groups are switched off with the reason recorded beside each (naive datetimes, which are deliberate for a daemon whose budgets are per local calendar day; blind excepts, which are all log-and-continue probes; and the iteration idiom for entries that vanish mid-scan), and the rest are fixed
+- `playtimed message list` prints the urgency of each template. The colour was computed and discarded
+
 ### Note
 Chrome reloads managed policy on launch and periodically thereafter, not immediately. A domain disallowed while the browser is open stays reachable until it reloads — the process layer is instantaneous and the browser layer is not.
 

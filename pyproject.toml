@@ -22,7 +22,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "ruff",
+    # Pinned: ruff's default rule set expands between minor releases, and an
+    # unpinned linter turns `make check` red on code nobody touched.
+    "ruff>=0.16,<0.17",
 ]
 
 [project.scripts]
@@ -34,3 +36,34 @@ packages = ["src/playtimed"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
+# Ruff's default rule selection grows across releases, which is how this
+# project reached 244 findings without a commit causing them. The gate is held
+# steady by pinning ruff itself in the dev extra, not by restating its defaults
+# here — a hand-maintained list would freeze out every rule added later.
+extend-select = [
+    "S306",  # insecure mktemp; a root daemon copying a user's file (see below)
+]
+
+ignore = [
+    # This daemon's limits reset at a local wall-clock hour and its budgets are
+    # per local calendar day. Timestamps are stored as naive ISO strings and
+    # compared as strings; making them aware changes what gets written and
+    # breaks comparison against every row already in the database.
+    "DTZ005", "DTZ006", "DTZ011",
+
+    # The poll loop and the browser probes must outlive anything a monitored
+    # process, a missing D-Bus session, or a locked SQLite file does to them.
+    # Every site logs and continues, or turns the failure into a CLI message.
+    # A narrow except here is a daemon that exits on an unexpected psutil error.
+    "BLE001",
+
+    # The psutil and browser-profile iteration idiom: an entry can vanish
+    # between listing and inspection, and the loop moves on.
+    "S110", "S112",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert; that is what they are for.
+"tests/*" = ["S101"]

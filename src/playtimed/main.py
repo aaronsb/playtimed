@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 playtimed - Claude-powered screen time daemon
 
@@ -13,18 +12,18 @@ import re
 import signal
 import sys
 import time
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, date
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar
 
 import psutil
 import yaml
 
-from .db import ActivityDB, get_connection, get_allowed_window
-from .router import MessageRouter, MessageContext, get_router
 from .browser import BrowserMonitor
 from .browser import policy as browser_policy
+from .db import ActivityDB, get_allowed_window, get_connection
+from .router import MessageContext, MessageRouter
 
 # Default paths
 DEFAULT_CONFIG = "/etc/playtimed/config.yaml"
@@ -73,7 +72,7 @@ class Colors:
     def header(cls, text): return f"{cls.BOLD}{cls.CYAN}{text}{cls.RESET}"
 
 
-def print_table(headers: list[str], rows: list[list[str]], col_widths: list[int] = None):
+def print_table(headers: list[str], rows: list[list[str]], col_widths: list[int] | None = None):
     """Print a formatted table with headers."""
     if not col_widths:
         col_widths = [max(len(str(h)), max((len(str(r[i])) for r in rows), default=0)) + 2
@@ -86,7 +85,7 @@ def print_table(headers: list[str], rows: list[list[str]], col_widths: list[int]
 
     # Rows
     for row in rows:
-        print(''.join(f"{str(c):<{w}}" for c, w in zip(row, col_widths)))
+        print(''.join(f"{c!s:<{w}}" for c, w in zip(row, col_widths)))
 
 
 @dataclass
@@ -94,7 +93,7 @@ class AppSession:
     """Tracks a single app usage session."""
     app: str
     start: str
-    end: Optional[str] = None
+    end: str | None = None
     duration: int = 0  # seconds
 
 
@@ -140,7 +139,7 @@ class ProcessMatch:
     category: str  # 'gaming', 'launcher'
     cmdline: str
     cpu_percent: float = 0.0
-    session_id: Optional[int] = None  # DB session tracking
+    session_id: int | None = None  # DB session tracking
     low_cpu_count: int = 0  # consecutive scans below CPU threshold (hysteresis)
 
 
@@ -177,14 +176,14 @@ class KDENotification(NotificationBackend):
         ]
 
         try:
-            subprocess.run(cmd, env=env, timeout=5, capture_output=True)
+            subprocess.run(cmd, env=env, timeout=5, capture_output=True, check=False)
             log.debug(f"Sent notification: {title}")
         except subprocess.TimeoutExpired:
             log.warning("Notification send timed out")
         except Exception as e:
             log.error(f"Failed to send notification: {e}")
 
-    def _get_user_env(self) -> Optional[dict]:
+    def _get_user_env(self) -> dict | None:
         """Get environment variables needed for GUI from user's session."""
         env = os.environ.copy()
 
@@ -208,55 +207,55 @@ class KDENotification(NotificationBackend):
 class MessageTemplates:
     """Claude personality message templates."""
 
-    GREET = [
-        "Good {time_of_day}, {name}. I'm Claude - your dad asked me to help out around here. "
+    GREET: ClassVar[list[str]] = [
+        ("Good {time_of_day}, {name}. I'm Claude - your dad asked me to help out around here. "
         "You have {total_remaining} of screen time today, including {gaming_remaining} for games. "
-        "What are we doing today?",
+        "What are we doing today?"),
     ]
 
-    GAME_START = [
-        "Ah, {app}! Good choice. Your gaming timer starts now. "
-        "You have {gaming_remaining} of gaming time left. Have fun!",
+    GAME_START: ClassVar[list[str]] = [
+        ("Ah, {app}! Good choice. Your gaming timer starts now. "
+        "You have {gaming_remaining} of gaming time left. Have fun!"),
 
         "{app}! Starting your timer. {gaming_remaining} remaining today. Enjoy!",
     ]
 
-    WARNING_30 = [
-        "Hey! 30 minutes of gaming time left for today. "
-        "Might want to start thinking about a good stopping point.",
+    WARNING_30: ClassVar[list[str]] = [
+        ("Hey! 30 minutes of gaming time left for today. "
+        "Might want to start thinking about a good stopping point."),
     ]
 
-    WARNING_10 = [
-        "10 minutes of gaming time left. I'll need to close {app} soon. "
-        "Wrap up what you're doing!",
+    WARNING_10: ClassVar[list[str]] = [
+        ("10 minutes of gaming time left. I'll need to close {app} soon. "
+        "Wrap up what you're doing!"),
     ]
 
-    WARNING_5 = [
+    WARNING_5: ClassVar[list[str]] = [
         "5 minutes! {app} closes in 5 minutes. Seriously, save now.",
     ]
 
-    WARNING_1 = [
-        "One minute left. {app} is closing in 60 seconds. "
-        "I really hope you saved.",
+    WARNING_1: ClassVar[list[str]] = [
+        ("One minute left. {app} is closing in 60 seconds. "
+        "I really hope you saved."),
     ]
 
-    TIME_UP = [
-        "That's your gaming time for today. {app} will close in 30 seconds. "
+    TIME_UP: ClassVar[list[str]] = [
+        ("That's your gaming time for today. {app} will close in 30 seconds. "
         "You still have {total_remaining} of screen time for other stuff. "
-        "Need help with homework? I'm actually pretty good at that.",
+        "Need help with homework? I'm actually pretty good at that."),
     ]
 
-    BLOCKED = [
-        "Nice try! Gaming time is done for today. "
-        "See you tomorrow. Maybe go outside? I hear the graphics are incredible.",
+    BLOCKED: ClassVar[list[str]] = [
+        ("Nice try! Gaming time is done for today. "
+        "See you tomorrow. Maybe go outside? I hear the graphics are incredible."),
 
-        "Still no. Gaming's done for today. "
-        "Your dad says hi, by the way.",
+        ("Still no. Gaming's done for today. "
+        "Your dad says hi, by the way."),
     ]
 
-    KILLED = [
-        "Time's up. {app} has been closed. "
-        "You did good today - see you tomorrow!",
+    KILLED: ClassVar[list[str]] = [
+        ("Time's up. {app} has been closed. "
+        "You did good today - see you tomorrow!"),
     ]
 
     @classmethod
@@ -332,7 +331,7 @@ class ClaudeDaemon:
     """Main daemon class."""
 
     # Critical system processes to never kill (not games, would break the system)
-    SYSTEM_PROCESSES = {
+    SYSTEM_PROCESSES: ClassVar[set[str]] = {
         'systemd', 'dbus-daemon', 'pipewire', 'pulseaudio', 'wireplumber',
         'kwin', 'kwin_wayland', 'kwin_x11', 'plasmashell', 'kded5', 'kded6',
         'Xorg', 'Xwayland', 'gnome-shell', 'mutter',
@@ -342,7 +341,8 @@ class ClaudeDaemon:
     }
 
     # Shell processes - not games
-    SHELL_PROCESSES = {'bash', 'zsh', 'fish', 'sh', 'dash', 'csh', 'tcsh'}
+    SHELL_PROCESSES: ClassVar[set[str]] = {
+        'bash', 'zsh', 'fish', 'sh', 'dash', 'csh', 'tcsh'}
 
     def __init__(self, config_path: str):
         self.config = self._load_config(config_path)
@@ -523,7 +523,7 @@ class ClaudeDaemon:
             self.notifiers[user] = KDENotification(user)
         return self.notifiers[user]
 
-    def _get_user_uid(self, user: str) -> Optional[int]:
+    def _get_user_uid(self, user: str) -> int | None:
         """Get UID for a username."""
         import pwd
         try:
@@ -532,7 +532,7 @@ class ClaudeDaemon:
             log.warning(f"User {user} not found in passwd")
             return None
 
-    def _get_browser_monitor(self, user: str) -> Optional[BrowserMonitor]:
+    def _get_browser_monitor(self, user: str) -> BrowserMonitor | None:
         """Get or create browser monitor for user."""
         if user not in self.browser_monitors:
             uid = self._get_user_uid(user)
@@ -542,7 +542,7 @@ class ClaudeDaemon:
         return self.browser_monitors[user]
 
     def _match_process_to_pattern(self, proc_name: str, cmdline: str,
-                                     patterns: list[dict]) -> Optional[dict]:
+                                     patterns: list[dict]) -> dict | None:
         """Try to match a process against a list of patterns."""
         for pdef in patterns:
             pattern = pdef.get("pattern", "")
@@ -1228,8 +1228,8 @@ class ClaudeDaemon:
             for user in self.users:
                 try:
                     self._process_user(user)
-                except Exception as e:
-                    log.error(f"Error processing user {user}: {e}", exc_info=True)
+                except Exception:
+                    log.exception("Error processing user %s", user)
 
             time.sleep(poll_interval)
 
@@ -1265,8 +1265,8 @@ def _get_user_status_row(db, user: str) -> dict:
     total_remaining = max(0, total_limit - total_used)
 
     # Calculate percentage used
-    gaming_pct = int((gaming_used / gaming_limit * 100)) if gaming_limit else 0
-    total_pct = int((total_used / total_limit * 100)) if total_limit else 0
+    gaming_pct = int(gaming_used / gaming_limit * 100) if gaming_limit else 0
+    total_pct = int(total_used / total_limit * 100) if total_limit else 0
 
     return {
         'user': user,
@@ -1317,7 +1317,7 @@ def cmd_status(args):
             print(f"Add users with: {Colors.info('sudo playtimed user add <username>')}")
             return
 
-    print(Colors.header(f"📊 Screen Time Status") + f" - {date.today().isoformat()}")
+    print(Colors.header("📊 Screen Time Status") + f" - {date.today().isoformat()}")
     print()
     print(f"{Colors.bold('User'):<20} {Colors.bold('Gaming'):<12} {'Progress':<14} {Colors.bold('Total'):<12} {'Progress':<14}")
     print(Colors.dim("─" * 70))
@@ -1399,16 +1399,16 @@ def cmd_maintenance(args):
         sessions_days=args.sessions_days
     )
 
-    print(f"\nBefore:")
+    print("\nBefore:")
     print(f"  Size: {result['before']['file_size_mb']:.2f} MB")
     print(f"  Events: {result['before']['events_count']}")
     print(f"  Sessions: {result['before']['sessions_count']}")
 
-    print(f"\nDeleted:")
+    print("\nDeleted:")
     for table, count in result['deleted'].items():
         print(f"  {table}: {count} rows")
 
-    print(f"\nAfter:")
+    print("\nAfter:")
     print(f"  Size: {result['after']['file_size_mb']:.2f} MB")
     print(f"  Events: {result['after']['events_count']}")
     print(f"  Sessions: {result['after']['sessions_count']}")
@@ -1516,7 +1516,7 @@ def cmd_audit(args):
         print(f"No terminations in the last {days} days.")
         return
 
-    print(Colors.header(f"Termination Audit") + f" (last {days} days)")
+    print(Colors.header("Termination Audit") + f" (last {days} days)")
     print()
 
     headers = ["Time", "User", "App", "Reason", "PID"]
@@ -1787,7 +1787,7 @@ def cmd_schedule(args):
         _print_schedule_grid(schedule, daily_limits)
 
 
-def _print_schedule_grid(schedule: str, daily_limits: list[int] = None):
+def _print_schedule_grid(schedule: str, daily_limits: list[int] | None = None):
     """Print a 7×24 schedule grid with CP437 box-drawing characters.
 
     Renders the schedule as a bordered grid with shade characters and
@@ -2302,7 +2302,7 @@ def cmd_patterns(args):
             print(f"{p['id']:<6} {type_str:<16} {state_str:<12} {category:<12} {owner:<10} {p['name']:<20} {runtime:<10}{enabled}")
 
         print()
-        print(Colors.dim(f"Pattern details: playtimed patterns show <id>"))
+        print(Colors.dim("Pattern details: playtimed patterns show <id>"))
 
     elif args.action == "add":
         pattern_id = db.add_pattern(
@@ -2362,7 +2362,7 @@ def cmd_patterns(args):
                 print(Colors.dim("No notes set."))
 
 
-def _resync_browser_policy(db, pattern_id: Optional[int] = None):
+def _resync_browser_policy(db, pattern_id: int | None = None):
     """Rewrite browser policy files after a change that could affect them.
 
     Skipped for process patterns, which the daemon enforces directly, and for
@@ -2401,7 +2401,7 @@ def cmd_discover(args):
         discovered = db.get_patterns_by_state('discovered')
         if not discovered:
             print(Colors.info("No discovered patterns awaiting review."))
-            print(f"\nRun the daemon to discover high-CPU processes and browser domains automatically.")
+            print("\nRun the daemon to discover high-CPU processes and browser domains automatically.")
             return
 
         print(Colors.header("👀 Discovered") + " (awaiting review)")
@@ -2546,7 +2546,8 @@ def cmd_message(args):
                 status = Colors.ok("●") if v['enabled'] else Colors.dim("○")
                 urgency = v['urgency']
                 urgency_color = Colors.RED if urgency == 'critical' else Colors.YELLOW if urgency == 'normal' else Colors.DIM
-                print(f"  {status} [{v['id']}] {v['title']}")
+                print(f"  {status} [{v['id']}] {v['title']} "
+                      f"{urgency_color}{urgency}{Colors.RESET}")
                 print(f"      {Colors.dim(v['body'][:60])}{'...' if len(v['body']) > 60 else ''}")
             print()
 

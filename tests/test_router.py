@@ -6,7 +6,7 @@ import tempfile
 import pytest
 
 from playtimed.db import ActivityDB
-from playtimed.router import MessageRouter, MessageContext
+from playtimed.router import MessageContext, MessageRouter
 
 
 @pytest.fixture
@@ -74,7 +74,7 @@ class TestMessageRouter:
         """Test fallback when no template exists."""
         # Use an intention that doesn't exist
         ctx = MessageContext(user="anders")
-        notification_id, backend = router.send('nonexistent_intention', ctx)
+        notification_id, _backend = router.send('nonexistent_intention', ctx)
 
         # Should still send via fallback
         assert notification_id >= 0

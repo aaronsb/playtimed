@@ -21,16 +21,13 @@ import json
 import logging
 import pwd
 import re
-import shutil
 import sqlite3
-import tempfile
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 
 import psutil
 
-from .base import BrowserWorker, BrowserTab, is_excluded_domain
+from .base import BrowserTab, BrowserWorker, copy_locked_db, is_excluded_domain
 
 log = logging.getLogger(__name__)
 
@@ -134,7 +131,7 @@ class FirefoxWorker(BrowserWorker):
 
         return tabs
 
-    def resolve_domain(self, uid: int, title: str) -> Optional[str]:
+    def resolve_domain(self, uid: int, title: str) -> str | None:
         """
         Resolve title to domain via Firefox places.sqlite.
 
@@ -153,7 +150,7 @@ class FirefoxWorker(BrowserWorker):
             log.debug("Resolved '%s' to '%s' via Firefox places", title[:30], domain)
         return domain
 
-    def _lookup_in_places(self, places_path: Path, title: str) -> Optional[str]:
+    def _lookup_in_places(self, places_path: Path, title: str) -> str | None:
         """
         Look up title in Firefox places.sqlite.
 
@@ -162,8 +159,7 @@ class FirefoxWorker(BrowserWorker):
         temp_db = None
         try:
             # Copy to temp file (Firefox locks the original)
-            temp_db = Path(tempfile.mktemp(suffix='.db'))
-            shutil.copy2(places_path, temp_db)
+            temp_db = copy_locked_db(places_path)
 
             conn = sqlite3.connect(temp_db)
 
@@ -195,7 +191,7 @@ class FirefoxWorker(BrowserWorker):
                 except Exception:
                     pass
 
-    def _find_firefox_profile(self, uid: int) -> Optional[Path]:
+    def _find_firefox_profile(self, uid: int) -> Path | None:
         """
         Find the default Firefox profile directory.
 
