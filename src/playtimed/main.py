@@ -299,6 +299,18 @@ def rank_patterns(gaming_patterns: list[dict],
     )
 
 
+# Pattern states strict mode lets run unchallenged. 'active' is a reviewed
+# pattern under time enforcement; 'ignored' is an explicit whitelist. A
+# 'discovered' pattern is an unreviewed sighting the admin has not ruled on,
+# which under a whitelist policy means it does not get to run.
+STRICT_ADMITTED_STATES = frozenset({'active', 'ignored'})
+
+
+def strict_admits(state: str) -> bool:
+    """Whether strict mode admits a process matching a pattern in this state."""
+    return state in STRICT_ADMITTED_STATES
+
+
 def format_duration(seconds: int) -> str:
     """Format seconds as human-readable duration."""
     if seconds < 60:
@@ -678,8 +690,19 @@ class ClaudeDaemon:
                         self.router.blocked_launch(user, proc_name)
 
                     # Remove from strict pending if it's a known pattern (active/ignored)
-                    if pid in self.strict_pending and state in ('active', 'ignored'):
+                    if pid in self.strict_pending and strict_admits(state):
                         del self.strict_pending[pid]
+
+                    # Matching a pattern is not the same as being admitted. A
+                    # 'discovered' match takes the same warn-then-kill path as a
+                    # process with no pattern at all. 'disallowed' is already
+                    # terminated above.
+                    if (self.mode == 'strict'
+                            and state != 'disallowed'
+                            and not strict_admits(state)
+                            and cpu >= self.discovery_config.get('cpu_threshold', 25)):
+                        self._handle_strict_unknown(user, proc_name, cmdline, pid,
+                                                    cpu, grace_seconds)
 
                 else:
                     # No pattern match
