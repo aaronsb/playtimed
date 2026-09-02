@@ -7,17 +7,27 @@ properties pinned here are security properties, not conveniences.
 import os
 import sqlite3
 import stat
-from pathlib import Path
 
 import pytest
 
-from playtimed.browser.chrome import _copy_locked_db as chrome_copy
-from playtimed.browser.firefox import _copy_locked_db as firefox_copy
+from playtimed.browser.base import copy_locked_db as base_copy
+from playtimed.browser.chrome import copy_locked_db as chrome_copy
+from playtimed.browser.firefox import copy_locked_db as firefox_copy
+
+
+def test_both_workers_share_one_definition():
+    """Regression: the helper was duplicated verbatim in both workers.
+
+    A security fix applied to one copy and not the other is the failure mode;
+    it happened once already while this was being written.
+    """
+    assert chrome_copy is base_copy
+    assert firefox_copy is base_copy
 
 
 @pytest.fixture(params=[chrome_copy, firefox_copy], ids=['chrome', 'firefox'])
 def copy_locked_db(request):
-    """Both workers carry the same helper; both must hold the same properties."""
+    """Reached through both workers, so neither import can silently diverge."""
     return request.param
 
 
@@ -59,32 +69,53 @@ class TestCopyLockedDb:
         finally:
             destination.unlink()
 
-    def test_destination_exists_before_it_is_written(self, copy_locked_db, source_db,
-                                                     monkeypatch, tmp_path):
-        """The path must be created by mkstemp, not merely predicted.
+    def test_destination_is_never_opened_by_name(self, copy_locked_db, source_db,
+                                                 monkeypatch):
+        """The copy must go through mkstemp's own descriptor.
 
-        Regression: `tempfile.mktemp` returned a name without creating the file,
-        so the monitored user could plant a symlink at that path and have root
-        write content they control — the source is a file they own — wherever
-        the symlink pointed.
+        Regression: the helper used to close that descriptor and hand the path
+        to `shutil.copyfile`, which reopens by name — and a write by name
+        follows a symlink and carries no O_EXCL. Naming the destination twice
+        reopens the question mkstemp was chosen to close, leaving only /tmp's
+        sticky bit between root and a user-directed write.
         """
-        observed = {}
-        real_copyfile = __import__('shutil').copyfile
+        import builtins
 
-        def spy(src, dst, *args, **kwargs):
-            # By the time content is written, the destination must already be a
-            # real file created with O_EXCL — not an absent path, not a symlink.
-            observed['existed'] = Path(dst).exists()
-            observed['is_symlink'] = Path(dst).is_symlink()
-            return real_copyfile(src, dst, *args, **kwargs)
+        opened = []
+        real_open = builtins.open
 
-        monkeypatch.setattr('shutil.copyfile', spy)
+        def spy(file, *args, **kwargs):
+            opened.append(str(file))
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, 'open', spy)
         destination = copy_locked_db(source_db)
         try:
-            assert observed['existed'] is True
-            assert observed['is_symlink'] is False
+            assert str(destination) not in opened
         finally:
             destination.unlink()
+
+    def test_failed_copy_leaves_nothing_behind(self, copy_locked_db, tmp_path,
+                                               monkeypatch):
+        """A failure has to clean up after itself.
+
+        Regression: mkstemp creates the file before the copy runs, and the
+        caller has no name for it until the helper returns — so its `finally`
+        cannot remove what a raising copy left behind. The monitored user can
+        drive this: a directory at the profile path satisfies the caller's
+        `.exists()` guard and makes the copy raise on every poll, orphaning a
+        root-owned file each time, without bound.
+        """
+        import tempfile as tempfile_module
+
+        monkeypatch.setattr(tempfile_module, 'tempdir', str(tmp_path))
+        planted = tmp_path / 'History'
+        planted.mkdir()
+
+        with pytest.raises(OSError):
+            copy_locked_db(planted)
+
+        assert list(tmp_path.glob('playtimed-*.db')) == []
 
     def test_each_call_gets_its_own_path(self, copy_locked_db, source_db):
         first = copy_locked_db(source_db)

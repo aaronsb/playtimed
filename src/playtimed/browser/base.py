@@ -5,9 +5,13 @@ Each browser platform (Chrome, Firefox, etc.) implements BrowserWorker
 to provide platform-specific tab detection and domain resolution.
 """
 
+import os
 import re
+import shutil
+import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 
 # Site signatures for fast-path domain resolution (skip DB lookup).
 # Shared across all browser workers. Checked longest-first to avoid partial matches.
@@ -82,6 +86,36 @@ def is_excluded_domain(domain: str) -> bool:
         if domain == suffix or domain.endswith('.' + suffix):
             return True
     return False
+
+
+def copy_locked_db(source: Path) -> Path:
+    """Copy a browser's locked SQLite file somewhere readable and return it.
+
+    This runs as root over a file the monitored user owns, so the destination
+    is never named twice. `mktemp` would hand out a path without creating it,
+    leaving a window to plant a symlink and have root write user-controlled
+    bytes wherever it points; reopening `mkstemp`'s path by name would reopen
+    that same question, since a write-by-path follows a symlink and carries no
+    O_EXCL. So the content goes through the descriptor mkstemp itself returned,
+    which resolves to the file it created and nothing else.
+
+    Writing through that descriptor also keeps its 0600. `shutil.copy2` would
+    carry the source's mode across instead, and browsers leave those profile
+    files world-readable.
+
+    The caller has no name for the file until this returns, so a failure has to
+    clean up after itself or the file is orphaned — which a directory left at
+    the profile path would otherwise do on every poll, forever.
+    """
+    fd, path = tempfile.mkstemp(suffix='.db', prefix='playtimed-')
+    destination = Path(path)
+    try:
+        with os.fdopen(fd, 'wb') as target, open(source, 'rb') as origin:
+            shutil.copyfileobj(origin, target)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    return destination
 
 
 @dataclass

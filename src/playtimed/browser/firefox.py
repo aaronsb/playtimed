@@ -19,38 +19,17 @@ Note: Firefox uses em-dash (—) not hyphen (-) in window titles:
 
 import json
 import logging
-import os
 import pwd
 import re
-import shutil
 import sqlite3
-import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
 import psutil
 
-from .base import BrowserTab, BrowserWorker, is_excluded_domain
+from .base import BrowserTab, BrowserWorker, copy_locked_db, is_excluded_domain
 
 log = logging.getLogger(__name__)
-
-
-def _copy_locked_db(source: Path) -> Path:
-    """Copy a browser's locked SQLite file somewhere readable and return it.
-
-    `tempfile.mkstemp` rather than `mktemp`: this runs as root, and mktemp
-    returns a path without creating it, so the monitored user can win the race
-    and leave a symlink where the copy lands — arbitrary content, since the
-    source is a file they own, written to an arbitrary path as root. The unit
-    sets PrivateTmp, but `playtimed run` started by hand does not get that.
-    """
-    fd, path = tempfile.mkstemp(suffix='.db', prefix='playtimed-')
-    os.close(fd)
-    destination = Path(path)
-    # copyfile, not copy2: copy2 would carry the source's mode across and widen
-    # mkstemp's 0600, leaving the user's browsing history readable in /tmp.
-    shutil.copyfile(source, destination)
-    return destination
 
 # Try to import lz4 for session file reading
 try:
@@ -180,7 +159,7 @@ class FirefoxWorker(BrowserWorker):
         temp_db = None
         try:
             # Copy to temp file (Firefox locks the original)
-            temp_db = _copy_locked_db(places_path)
+            temp_db = copy_locked_db(places_path)
 
             conn = sqlite3.connect(temp_db)
 
