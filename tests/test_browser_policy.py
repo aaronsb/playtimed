@@ -13,8 +13,9 @@ import pytest
 from playtimed.browser import policy
 
 
-def domain(pattern, state, ptype='browser_domain'):
-    return {'pattern': pattern, 'monitor_state': state, 'pattern_type': ptype}
+def domain(pattern, state, category=None, ptype='browser_domain'):
+    return {'pattern': pattern, 'monitor_state': state,
+            'category': category, 'pattern_type': ptype}
 
 
 PATTERNS = [
@@ -217,3 +218,146 @@ class TestApplyPlans:
             'passthrough', PATTERNS,
             targets=[chrome_target(managed / policy.POLICY_FILENAME)])
         assert policy.apply_plans(plans) == []
+
+
+class TestUnenforceableBudgets:
+    """An 'active' gaming domain is a budget playtimed cannot enforce."""
+
+    def test_active_gaming_domain_is_blocked_not_permitted(self):
+        """Regression: it would otherwise land in the strict-mode allowlist.
+
+        A host running in normal mode accumulates gaming-category domains in
+        'active' state — that is what tracking YouTube time looks like.
+        Reading 'active' as "permitted" would turn a lockdown into a policy
+        that admits exactly the sites it means to block.
+        """
+        permitted, blocked = policy.partition_domains(
+            [domain('youtube.com', 'active', 'gaming')])
+        assert permitted == []
+        assert blocked == ['youtube.com']
+
+    def test_active_educational_domain_is_permitted(self):
+        permitted, _ = policy.partition_domains(
+            [domain('ixl.com', 'active', 'educational')])
+        assert permitted == ['ixl.com']
+
+    def test_ignored_gaming_domain_is_still_permitted(self):
+        """'ignored' is an explicit whitelist decision, category regardless."""
+        permitted, _ = policy.partition_domains(
+            [domain('example.com', 'ignored', 'gaming')])
+        assert permitted == ['example.com']
+
+
+class TestCleanDomain:
+    """Stored hostnames can carry cruft that renders an invalid pattern."""
+
+    def test_port_is_stripped(self):
+        """Firefox silently drops a match pattern with a port — it fails open."""
+        permitted, _ = policy.partition_domains(
+            [domain('ixl.com:8443', 'ignored')])
+        assert permitted == ['ixl.com']
+
+    def test_credentials_are_stripped(self):
+        permitted, _ = policy.partition_domains(
+            [domain('user@ixl.com', 'ignored')])
+        assert permitted == ['ixl.com']
+
+    def test_case_is_normalised(self):
+        permitted, _ = policy.partition_domains([domain('IXL.CoM', 'ignored')])
+        assert permitted == ['ixl.com']
+
+    def test_trailing_dot_is_stripped(self):
+        permitted, _ = policy.partition_domains([domain('ixl.com.', 'ignored')])
+        assert permitted == ['ixl.com']
+
+    def test_non_hostname_is_dropped(self):
+        permitted, blocked = policy.partition_domains([
+            domain('https://ixl.com/path', 'ignored'),
+            domain('not a host', 'disallowed'),
+        ])
+        assert permitted == []
+        assert blocked == []
+
+
+class TestFirefoxMerge:
+    """Firefox has one policies.json, so playtimed owns a key, not the file."""
+
+    @pytest.fixture
+    def ffdir(self, tmp_path):
+        d = tmp_path / 'firefox' / 'policies'
+        d.mkdir(parents=True)
+        return d
+
+    def ff_plan(self, ffdir, mode, patterns=None):
+        target = policy.PolicyTarget(
+            'firefox', str(ffdir / 'policies.json'), policy.firefox_policy,
+            merge_key=policy.FIREFOX_OWNED_KEY)
+        return policy.plan_policies(mode, PATTERNS if patterns is None else patterns,
+                                    targets=[target])
+
+    def test_administrator_policies_survive_a_write(self, ffdir):
+        f = ffdir / 'policies.json'
+        f.write_text(json.dumps({'policies': {
+            'DisableTelemetry': True,
+            'WebsiteFilter': {'Block': ['*://*.stale.example/*']},
+        }}))
+
+        policy.apply_plans(self.ff_plan(ffdir, 'strict'))
+
+        written = json.loads(f.read_text())
+        assert written['policies']['DisableTelemetry'] is True
+        assert written['policies']['WebsiteFilter']['Block'] == ['<all_urls>']
+
+    def test_passthrough_removes_only_the_owned_key(self, ffdir):
+        f = ffdir / 'policies.json'
+        f.write_text(json.dumps({'policies': {'DisableTelemetry': True}}))
+
+        policy.apply_plans(self.ff_plan(ffdir, 'strict'))
+        assert 'WebsiteFilter' in json.loads(f.read_text())['policies']
+
+        policy.apply_plans(self.ff_plan(ffdir, 'passthrough'))
+        written = json.loads(f.read_text())
+        assert 'WebsiteFilter' not in written['policies']
+        assert written['policies']['DisableTelemetry'] is True
+
+    def test_file_is_removed_when_nothing_is_left(self, ffdir):
+        f = ffdir / 'policies.json'
+        policy.apply_plans(self.ff_plan(ffdir, 'strict'))
+        assert f.exists()
+
+        policy.apply_plans(self.ff_plan(ffdir, 'passthrough'))
+        assert not f.exists()
+
+    def test_malformed_existing_file_is_replaced_not_merged(self, ffdir):
+        f = ffdir / 'policies.json'
+        f.write_text('{ this is not json')
+        policy.apply_plans(self.ff_plan(ffdir, 'strict'))
+        assert json.loads(f.read_text())['policies']['WebsiteFilter']['Block'] == ['<all_urls>']
+
+
+class TestWriteChurn:
+    """The daemon reloads on a timer; an unchanged policy must not be rewritten."""
+
+    @pytest.fixture
+    def managed(self, tmp_path):
+        d = tmp_path / 'managed'
+        d.mkdir(parents=True)
+        return d
+
+    def test_second_apply_writes_nothing(self, managed):
+        plans = policy.plan_policies(
+            'strict', PATTERNS,
+            targets=[chrome_target(managed / policy.POLICY_FILENAME)])
+        assert policy.apply_plans(plans) == [f'wrote {managed / "playtimed.json"}']
+        assert policy.apply_plans(plans) == []
+
+    def test_a_real_change_still_writes(self, managed):
+        target = chrome_target(managed / policy.POLICY_FILENAME)
+        policy.apply_plans(policy.plan_policies('strict', PATTERNS, targets=[target]))
+
+        changed = PATTERNS + [domain('khanacademy.org', 'ignored')]
+        actions = policy.apply_plans(
+            policy.plan_policies('strict', changed, targets=[target]))
+        assert len(actions) == 1
+        written = json.loads((managed / 'playtimed.json').read_text())
+        assert 'khanacademy.org' in written['URLAllowlist']

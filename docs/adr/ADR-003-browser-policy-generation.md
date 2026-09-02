@@ -25,20 +25,32 @@ playtimed generates the browser's managed policy file from its own `browser_doma
 | Daemon mode | Generated policy |
 |---|---|
 | `normal` | `URLBlocklist` from every `disallowed` domain |
-| `strict` | `URLBlocklist: ["*"]` plus `URLAllowlist` from every `active` and `ignored` domain |
-| `passthrough` | No policy file; any previously generated file is removed |
+| `strict` | `URLBlocklist: ["*"]` plus `URLAllowlist` from every permitted domain |
+| `passthrough` | No rules; a previously generated policy is withdrawn |
 
 Strict mode's browser policy mirrors its process policy: an allowlist, with `discovered` outside it. This is the same admission rule ADR-003's sibling fix applied to `strict_admits()` — a state nobody has ruled on does not grant access.
 
+Strict mode carries one exception. `active` means "tracked, and counted against the limit", which for a process is enforceable — the daemon kills it when the budget runs out. For a domain it is not: playtimed cannot close a tab. An `active` gaming-category domain is therefore a budget with no enforcement behind it, and is written into the blocklist rather than admitted on a promise that cannot be kept. `ignored` remains an unconditional permit, category regardless.
+
+This matters most on exactly the hosts that need locking down. A host that has run in `normal` mode accumulates gaming domains in `active` state — that is what tracking YouTube time looks like. Reading `active` as "permitted" would generate an allowlist containing precisely the sites the lockdown exists to block.
+
 ### Ownership boundary
 
-playtimed writes exactly one file per browser family, named `playtimed.json`, and touches no other file in the policy directory. An administrator who wants rules playtimed does not model — extension blocklists, incognito availability, download restrictions — writes a second file alongside it. Chrome merges every file in the directory; a conflict resolves to the more restrictive value. playtimed neither reads nor overwrites files it did not create.
+Chrome-family browsers read a policy *directory* and merge every file in it, resolving conflicts to the more restrictive value. There playtimed writes exactly one file, `playtimed.json`, and neither reads nor overwrites any other. An administrator who wants rules playtimed does not model — extension blocklists, incognito availability, download restrictions — writes a second file alongside it.
+
+Firefox has no such directory: every policy lives in one `policies.json`. Owning that file would mean destroying the administrator's Firefox policy on write and deleting it on `passthrough`. So for Firefox the unit of ownership is a key rather than a file — playtimed reads the existing document, replaces `policies.WebsiteFilter`, and writes the rest back untouched. Relaxing to `passthrough` removes that key and leaves the document; the file is deleted only when nothing remains in it.
+
+### Scope
+
+Managed policy is per-browser and machine-wide. There is no per-user equivalent, so the generated policy is built from every owner's domains at once and applies to anyone who logs into the machine — an administrator who browses on the same host included. Separating them requires a separate machine or a browser playtimed does not model.
 
 ### Invocation
 
 Generation runs when the daemon starts, on SIGHUP, and on any CLI command that changes a browser domain pattern's state or the daemon mode. `playtimed browser-policy` prints what would be written; `playtimed browser-policy --sync` writes it.
 
-The daemon already runs as root, so no new privilege is required. A generation failure logs and does not abort the poll loop — a browser policy that failed to update is a degraded state, not a reason to stop enforcing process limits.
+The daemon runs as root, but under `ProtectSystem=strict`, which makes all of `/etc` read-only. Each browser's configuration root is granted back through an optional `ReadWritePaths=-/etc/...` entry in the unit; without them every daemon-side write fails `EROFS` and the generated policy silently stops tracking the database. Writes are skipped when the file already holds the intended content, so the daemon's periodic reload does not rewrite policy every few minutes.
+
+A generation failure logs and does not abort the poll loop — a browser policy that failed to update is a degraded state, not a reason to stop enforcing process limits.
 
 ## Consequences
 
@@ -48,11 +60,13 @@ The daemon already runs as root, so no new privilege is required. A generation f
 
 **Policy changes need a browser restart.** Chrome reloads managed policy on launch and periodically thereafter, not immediately. A domain disallowed while Chrome is open stays reachable until it reloads. The process layer is instantaneous and the browser layer is not; the CLI says so when it writes.
 
-**Firefox needs a second generator.** Its policy file is `policies.json` under the distribution directory with a different schema (`WebsiteFilter`). The generator is per-browser-family, matching the existing `BrowserWorker` split.
+**Firefox is generated from the same inputs through a different renderer.** Its schema is `WebsiteFilter` with `Block`/`Exceptions` over match patterns rather than bare hosts, so a stored hostname carrying a port or credentials renders a pattern Firefox silently drops — failing open. Domains are reduced to a bare host before rendering, and anything that is not a hostname is discarded rather than emitted.
 
 **A non-Chrome browser installed later is unrestricted until playtimed models it.** Managed policy is per-browser; there is no system-wide equivalent. Restricting which browsers can be installed is a package-management concern, outside playtimed.
 
-**Time tracking and access control now have different vocabularies for the same row.** `active` means "counts toward the limit" for a process and "permitted" for a domain under strict mode. This overload is inherited from ADR-001 and is not resolved here.
+**Time tracking and access control share one vocabulary that does not quite fit both.** `active` means "counts toward the limit" for a process and "permitted" for a domain, and the gaming-category exception above patches over the gap rather than closing it. The overload is inherited from ADR-001 and is not resolved here.
+
+**Browser domain rows must stay out of process matching.** A `browser_domain` pattern holds a hostname; process matching is an unanchored regex search over process name and command line. A domain row reaching that scan means any process whose cmdline contains the string is treated as that pattern, and a disallowed one is killed — `discover disallow <domain>` producing a dead process, the outcome this ADR rejects. `get_patterns()` now filters to `pattern_type = 'process'` by default.
 
 ## Alternatives Considered
 

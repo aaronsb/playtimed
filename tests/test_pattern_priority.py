@@ -80,3 +80,56 @@ class TestRankPatterns:
         ranked = rank_patterns([empty_owner], [scoped])
 
         assert ranked[0] is scoped
+
+
+class TestPatternTypeIsolation:
+    """Browser domain rows must not be matched against process command lines.
+
+    A browser_domain pattern holds a hostname, not a process regex. Because
+    matching is an unanchored `re.search` over both process name and cmdline,
+    a domain row reaching the process scan means an unrelated process whose
+    cmdline happens to contain that string is treated as that pattern — and a
+    disallowed domain would kill it. `discover disallow <domain>` producing a
+    dead process is the outcome ADR-003 explicitly rejects.
+    """
+
+    def test_get_patterns_excludes_browser_domains(self, tmp_path):
+        from playtimed.db import ActivityDB
+
+        db = ActivityDB(str(tmp_path / 'test.db'))
+        db.set_user_limits('anders', gaming_limit=120, daily_total=180)
+        db.add_browser_pattern('discord.com', 'Discord', 'gaming', 'chrome', 'anders')
+
+        names = [p['name'] for p in db.get_patterns(
+            owner='anders', enabled_only=True, include_all_states=True)]
+        assert 'Discord' not in names
+
+    def test_category_filtered_queries_exclude_browser_domains(self, tmp_path):
+        """The gaming/launcher queries feeding _find_gaming_processes leak too."""
+        from playtimed.db import ActivityDB
+
+        db = ActivityDB(str(tmp_path / 'test.db'))
+        db.set_user_limits('anders', gaming_limit=120, daily_total=180)
+        db.add_browser_pattern('youtube.com', 'YouTube', 'gaming', 'chrome', 'anders')
+
+        names = [p['name'] for p in db.get_patterns(category='gaming', owner='anders')]
+        assert 'YouTube' not in names
+
+    def test_browser_domains_are_still_reachable_by_their_own_query(self, tmp_path):
+        from playtimed.db import ActivityDB
+
+        db = ActivityDB(str(tmp_path / 'test.db'))
+        db.add_browser_pattern('ixl.com', 'IXL', 'educational', 'chrome', 'anders')
+
+        names = [p['name'] for p in db.get_browser_patterns(include_all_states=True)]
+        assert 'IXL' in names
+
+    def test_disabled_browser_domains_are_excluded(self, tmp_path):
+        from playtimed.db import ActivityDB
+
+        db = ActivityDB(str(tmp_path / 'test.db'))
+        pid = db.add_browser_pattern('ixl.com', 'IXL', 'educational', 'chrome', 'anders')
+        db.update_pattern(pid, enabled=0)
+
+        names = [p['name'] for p in db.get_browser_patterns(include_all_states=True)]
+        assert 'IXL' not in names
