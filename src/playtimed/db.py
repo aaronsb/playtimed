@@ -1628,29 +1628,3 @@ class ActivityDB:
                 VALUES (?, ?, NULL, 'browser_domain', ?, 'discovered', ?, 1, 0, ?, ?, ?)
             """, (domain, domain, browser, owner, now, now, now))
             return cursor.lastrowid
-
-        if not updates:
-            return
-
-        with get_connection(self.db_path) as conn:
-            # Check if row exists
-            exists = conn.execute("""
-                SELECT 1 FROM daily_summary WHERE user = ? AND date = ?
-            """, (user, today)).fetchone()
-
-            if exists:
-                set_clause = ', '.join(f"{k} = ?" for k in updates.keys())
-                conn.execute(
-                    f"UPDATE daily_summary SET {set_clause} WHERE user = ? AND date = ?",
-                    (*updates.values(), user, today)
-                )
-            else:
-                # Insert new row with defaults
-                updates['date'] = today
-                updates['user'] = user
-                columns = ', '.join(updates.keys())
-                placeholders = ', '.join('?' * len(updates))
-                conn.execute(
-                    f"INSERT INTO daily_summary ({columns}) VALUES ({placeholders})",
-                    tuple(updates.values())
-                )

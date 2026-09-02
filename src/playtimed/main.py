@@ -2362,7 +2362,7 @@ def cmd_patterns(args):
                 print(Colors.dim("No notes set."))
 
 
-def _resync_browser_policy(db, pattern_id: int = None):
+def _resync_browser_policy(db, pattern_id: Optional[int] = None):
     """Rewrite browser policy files after a change that could affect them.
 
     Skipped for process patterns, which the daemon enforces directly, and for
