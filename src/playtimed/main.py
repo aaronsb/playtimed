@@ -24,6 +24,7 @@ import yaml
 from .db import ActivityDB, get_connection, get_allowed_window
 from .router import MessageRouter, MessageContext, get_router
 from .browser import BrowserMonitor
+from .browser import policy as browser_policy
 
 # Default paths
 DEFAULT_CONFIG = "/etc/playtimed/config.yaml"
@@ -451,6 +452,18 @@ class ClaudeDaemon:
             log.info(f"Mode changed: {old_mode} -> {self.mode}")
             # Notify all users about mode change via router
             self.router.mode_change(self.mode)
+
+        # Browser rules are enforced by the browser, so they have to be
+        # rewritten whenever the state they derive from changes (ADR-003).
+        self._sync_browser_policy()
+
+    def _sync_browser_policy(self):
+        """Regenerate browser managed-policy files from the database."""
+        try:
+            for action in browser_policy.sync(self.db):
+                log.info("Browser policy: %s", action)
+        except Exception as e:
+            log.warning("Browser policy sync failed: %s", e)
 
     def _load_config(self, path: str) -> dict:
         """Load configuration from YAML file."""
@@ -1191,6 +1204,7 @@ class ClaudeDaemon:
                  f"DB size: {maint['after']['file_size_mb']:.2f} MB")
 
         self._reconcile_open_sessions()
+        self._sync_browser_policy()
 
         poll_interval = self.config["daemon"].get("poll_interval", 30)
 
@@ -1343,6 +1357,9 @@ def cmd_mode(args):
             db.set_daemon_mode(args.set_mode)
             print(f"Mode set to: {Colors.bold(args.set_mode)}")
             print(Colors.dim("Daemon will pick up change within ~5 minutes, or restart it."))
+            # Mode decides whether browser rules are an allowlist or a
+            # blocklist, so the generated policy changes with it (ADR-003).
+            _resync_browser_policy(db)
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
@@ -2345,6 +2362,28 @@ def cmd_patterns(args):
                 print(Colors.dim("No notes set."))
 
 
+def _resync_browser_policy(db, pattern_id: int = None):
+    """Rewrite browser policy files after a change that could affect them.
+
+    Skipped for process patterns, which the daemon enforces directly, and for
+    a non-root caller, who has nothing to write with.
+    """
+    if pattern_id is not None:
+        pattern = db.get_pattern_by_id(pattern_id)
+        if not pattern or pattern.get('pattern_type') != 'browser_domain':
+            return
+
+    if os.geteuid() != 0:
+        print(Colors.dim("Not root - browser policy not updated."))
+        return
+
+    actions = browser_policy.sync(db)
+    for action in actions:
+        print(Colors.dim(f"  {action}"))
+    if any(a.startswith('wrote') for a in actions):
+        print(Colors.dim("Chrome applies this on its next launch or policy refresh."))
+
+
 def cmd_discover(args):
     """Manage process discovery."""
     if args.action in ("promote", "ignore", "disallow", "config"):
@@ -2399,14 +2438,21 @@ def cmd_discover(args):
         if name:
             msg += f" as '{name}'"
         print(msg)
+        _resync_browser_policy(db, args.id)
 
     elif args.action == "ignore":
         db.set_pattern_state(args.id, 'ignored')
         print(f"Marked pattern {args.id} as ignored")
+        _resync_browser_policy(db, args.id)
 
     elif args.action == "disallow":
+        pattern = db.get_pattern_by_id(args.id)
         db.set_pattern_state(args.id, 'disallowed')
-        print(f"Marked pattern {args.id} as disallowed (will be terminated on detection)")
+        if pattern and pattern.get('pattern_type') == 'browser_domain':
+            print(f"Marked domain {args.id} as disallowed (blocked by browser policy)")
+        else:
+            print(f"Marked pattern {args.id} as disallowed (will be terminated on detection)")
+        _resync_browser_policy(db, args.id)
 
     elif args.action == "config":
         if args.key and args.value:
@@ -2419,6 +2465,49 @@ def cmd_discover(args):
             print(f"  cpu_threshold:        {config['cpu_threshold']}%")
             print(f"  sample_window_seconds: {config['sample_window_seconds']}")
             print(f"  min_samples:          {config['min_samples']}")
+
+
+def cmd_browser_policy(args):
+    """Show or write the browser managed-policy files."""
+    try:
+        db = ActivityDB(args.db)
+    except Exception:
+        print(f"Error: Cannot access database at {args.db}", file=sys.stderr)
+        sys.exit(1)
+
+    mode = db.get_daemon_mode()
+    patterns = db.get_browser_patterns(include_all_states=True)
+    permitted, blocked = browser_policy.partition_domains(patterns)
+    plans = browser_policy.plan_policies(mode, patterns)
+
+    print(Colors.header("Browser Policy"))
+    print()
+    print(f"  Mode:      {Colors.bold(mode)}")
+    print(f"  Permitted: {', '.join(permitted) if permitted else Colors.dim('none')}")
+    print(f"  Blocked:   {', '.join(blocked) if blocked else Colors.dim('none')}")
+    print()
+
+    if not plans:
+        print(Colors.dim("  No browser with a managed-policy directory was found."))
+        return
+
+    for plan in plans:
+        label = Colors.error('remove') if plan.removes else Colors.ok('write')
+        print(f"  {label} {plan.path}")
+        if not plan.removes:
+            for line in plan.render().rstrip().splitlines():
+                print(Colors.dim(f"      {line}"))
+    print()
+
+    if not args.sync:
+        print(f"Apply with: {Colors.info('sudo playtimed browser-policy --sync')}")
+        return
+
+    require_root("browser-policy --sync")
+    for action in browser_policy.apply_plans(plans):
+        print(f"  {action}")
+    print()
+    print(Colors.dim("Chrome applies this on its next launch or policy refresh."))
 
 
 def cmd_message(args):
@@ -2686,6 +2775,12 @@ Examples:
     mode_parser.add_argument("set_mode", nargs="?", choices=["normal", "passthrough", "strict"],
                              help="Mode to set (normal, passthrough, strict)")
 
+    # Browser policy
+    policy_parser = subparsers.add_parser(
+        "browser-policy", help="Show or write browser managed-policy files")
+    policy_parser.add_argument("--sync", action="store_true",
+                               help="Write the policy files (requires root)")
+
     # Pattern management
     pattern_parser = subparsers.add_parser("patterns", help="Manage process patterns")
     pattern_sub = pattern_parser.add_subparsers(dest="action")
@@ -2811,6 +2906,9 @@ Examples:
         cmd_maintenance(args)
     elif args.command == "mode":
         cmd_mode(args)
+    elif args.command == "browser-policy":
+        cmd_browser_policy(args)
+
     elif args.command == "patterns":
         if args.action:
             cmd_patterns(args)

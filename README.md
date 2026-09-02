@@ -36,6 +36,7 @@ Interactive curses TUI for per-hour, per-day schedule control with paint mode an
 - **Per-hour schedule grid** - 7x24 allowed/blocked hours with interactive curses editor
 - **Per-day gaming limits** - different minute budgets for each day of the week
 - **Browser domain tracking** - monitors Chrome and Firefox via window titles and session files
+- **Browser policy generation** - writes Chrome and Firefox managed policy from the domains in the database, so a disallowed site is blocked at navigation time
 - **SQLite storage** for patterns, limits, and metrics
 - **KDE notifications** with personality messages
 - **Termination audit** - tracks every enforcement action
@@ -65,16 +66,23 @@ playtimed user edit <name>                       # Edit user limits
 playtimed patterns list                          # Show detection patterns
 playtimed patterns add <regex> <name> <category> # Add pattern
 playtimed discover list                          # Show discovered processes
+playtimed discover disallow <id>                 # Block a process or domain
+playtimed mode [normal|passthrough|strict]       # View or set enforcement mode
+playtimed browser-policy [--sync]                # Show or write browser managed policy
 playtimed maintenance                            # Cleanup old data
 ```
 
 ## Files
 
 ```
-/opt/playtimed/          # Installation with isolated venv
-/etc/playtimed/          # Config
-/var/lib/playtimed/      # SQLite database
+/etc/playtimed/                          # Config
+/var/lib/playtimed/                      # SQLite database
+/etc/opt/chrome/policies/managed/        # Generated Chrome policy (playtimed.json)
+/etc/firefox/policies/                   # Generated Firefox policy (policies.json)
 ```
+
+Installing from source with `scripts/install.sh` puts an isolated venv at
+`/opt/playtimed/` instead; the AUR package installs into the system prefix.
 
 ## License
 
