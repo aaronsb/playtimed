@@ -7,16 +7,23 @@
 ### What's Built
 - [x] Process monitoring daemon with CPU-based activity detection
 - [x] SQLite database for metrics, patterns, and config
+- [x] Three enforcement modes: `normal`, `passthrough`, `strict` (allowlist only)
+- [x] Process discovery workflow — promote, ignore, disallow
+- [x] Per-hour schedule grid (7x24) with a curses editor, and per-day limits
+- [x] Browser domain tracking for Chrome and Firefox via window titles (ADR-001)
+- [x] Browser managed-policy generation — the browser enforces URL rules from
+      the domains in the database (ADR-003)
+- [x] Session end detection — `natural`, `enforced`, `logout`, `orphaned`
 - [x] KDE notification backend with Claude personality
-- [x] CLI for status, user management, pattern management, maintenance
+- [x] CLI for status, schedules, users, patterns, discovery, policy, maintenance
 - [x] Automatic DB retention (30 days events, 90 days sessions, forever summaries)
-- [x] Install/uninstall scripts with isolated venv
+- [x] Packaged for Arch: AUR and the `[aaronsb]` repo, published by arch-repo
 
 ### What's Not Built Yet
 - [ ] Clippy frontend (KDE Plasma widget idea)
 - [ ] Web dashboard for parent monitoring
 - [ ] Login-time greeting notification
-- [ ] Session end detection (game closed naturally vs killed)
+- [ ] Decomposing `main.py`, still a ~2900-line monolith (ADR-002, proposed)
 
 ## The Vibe
 
@@ -48,25 +55,28 @@ Instead of boring parental control software, we're building something with perso
 
 **Files:**
 ```
-/opt/playtimed/           # Installation
-  venv/                 # Isolated Python environment
-  src/                  # Source copy for debugging
+/usr/bin/playtimed        # CLI and daemon entry point (package)
+/usr/bin/playtimed-notify # Notification helper
 
 /etc/playtimed/
-  config.yaml           # Basic daemon config (poll interval, paths)
+  config.yaml             # Basic daemon config (poll interval, paths)
 
 /var/lib/playtimed/
   playtimed.db            # SQLite database (patterns, limits, events, sessions)
 
-/usr/local/bin/playtimed  # CLI wrapper
+/etc/opt/chrome/policies/managed/
+  playtimed.json          # Generated URL rules — playtimed owns this file only
+/etc/firefox/policies/
+  policies.json           # playtimed owns the policies.WebsiteFilter key
+
+/opt/playtimed/           # Only when installed from source via scripts/install.sh
 ```
 
 ## Installation
 
 ```bash
-# On brick (as root)
-cd /path/to/playtimed
-./scripts/install.sh
+# From the [aaronsb] repo or the AUR
+pacman -S playtimed        # or: yay -S playtimed
 
 # Configure
 playtimed user add anders --gaming-limit 120 --daily-total 180
@@ -74,6 +84,10 @@ playtimed user add anders --gaming-limit 120 --daily-total 180
 # Start
 systemctl enable --now playtimed
 ```
+
+`scripts/install.sh` still exists and installs an isolated venv under
+`/opt/playtimed` instead. It is the from-source path; the package is what
+brick runs.
 
 ## CLI Reference
 
