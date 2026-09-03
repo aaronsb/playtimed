@@ -1,6 +1,6 @@
 # ADR-001: Browser Domain Tracking
 
-Status: Proposed
+Status: Accepted — implemented; the `disallow` stretch goal is superseded by ADR-003
 Date: 2026-01-22
 Deciders: @aaron, @claude
 
