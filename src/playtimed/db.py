@@ -194,6 +194,22 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 updated_at TEXT NOT NULL
             );
 
+            -- Window schedules: when a user may spend time, and how much (ADR-004)
+            CREATE TABLE IF NOT EXISTS schedule_windows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user TEXT NOT NULL,
+                days TEXT NOT NULL,              -- 7 chars, Mon..Sun, '1' = applies
+                start_hour INTEGER NOT NULL,     -- 0..23, inclusive
+                end_hour INTEGER NOT NULL,       -- 1..24, exclusive
+                mode TEXT NOT NULL,              -- 'restricted' | 'open'
+                budget_minutes INTEGER,          -- NULL = uncapped
+                meters TEXT NOT NULL DEFAULT 'gaming',  -- 'gaming' | 'all'
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_windows_user
+                ON schedule_windows(user);
+
             -- Indexes for common queries
             CREATE INDEX IF NOT EXISTS idx_events_user_date
                 ON events(user, timestamp);
@@ -479,6 +495,58 @@ def migrate_db(db_path: str = DEFAULT_DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_hourly_user_date
                 ON hourly_activity(user, date);
         """)
+
+        # ADR-004: window schedules replace the binary grid and per-day budgets.
+        conn.executescript("""
+            -- Window schedules: when a user may spend time, and how much (ADR-004)
+            CREATE TABLE IF NOT EXISTS schedule_windows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user TEXT NOT NULL,
+                days TEXT NOT NULL,              -- 7 chars, Mon..Sun, '1' = applies
+                start_hour INTEGER NOT NULL,     -- 0..23, inclusive
+                end_hour INTEGER NOT NULL,       -- 1..24, exclusive
+                mode TEXT NOT NULL,              -- 'restricted' | 'open'
+                budget_minutes INTEGER,          -- NULL = uncapped
+                meters TEXT NOT NULL DEFAULT 'gaming',  -- 'gaming' | 'all'
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_windows_user
+                ON schedule_windows(user);
+        """)
+        _migrate_windows(conn)
+
+
+
+def _migrate_windows(conn):
+    """Convert each user's legacy grid and per-day budgets into windows.
+
+    Runs once per user: a user who already has windows is left alone, so an
+    administrator's edits survive every later migration pass. The legacy
+    columns are read and not cleared, so a downgrade to 0.5.x still finds its
+    configuration (ADR-004).
+    """
+    from .windows import from_legacy
+
+    rows = conn.execute("SELECT user, schedule, daily_limits FROM user_limits").fetchall()
+    now = datetime.now().isoformat()
+
+    for user, schedule, daily_limits in rows:
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM schedule_windows WHERE user = ?", (user,)
+        ).fetchone()[0]
+        if existing:
+            continue
+
+        limits = parse_daily_limits(daily_limits) if daily_limits else [120] * 7
+        for w in from_legacy(schedule or DEFAULT_SCHEDULE, limits):
+            conn.execute("""
+                INSERT INTO schedule_windows
+                    (user, days, start_hour, end_hour, mode, budget_minutes,
+                     meters, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (user, w.days, w.start_hour, w.end_hour, w.mode,
+                  w.budget_minutes, w.meters, now, now))
 
 
 def _seed_default_templates(conn):
@@ -1252,6 +1320,69 @@ class ActivityDB:
                 "UPDATE user_limits SET daily_limits = ?, updated_at = ? WHERE user = ?",
                 (dl_str, now, user)
             )
+
+    # --- Window Schedules (ADR-004) ---
+
+    def get_windows(self, user: str) -> list:
+        """Every window for this user, ordered by start hour."""
+        from .windows import Window
+
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute("""
+                SELECT id, days, start_hour, end_hour, mode, budget_minutes, meters
+                FROM schedule_windows WHERE user = ?
+                ORDER BY start_hour, days
+            """, (user,)).fetchall()
+
+        return [Window(days=r['days'], start_hour=r['start_hour'],
+                       end_hour=r['end_hour'], mode=r['mode'],
+                       budget_minutes=r['budget_minutes'], meters=r['meters'],
+                       id=r['id'])
+                for r in rows]
+
+    def set_windows(self, user: str, windows: list):
+        """Replace this user's window set, refusing one that does not tile.
+
+        Written as a single transaction: a rejected set leaves the previous
+        schedule in force rather than a half-applied one.
+        """
+        from .windows import ScheduleError, validate
+
+        problems = validate(windows)
+        if problems:
+            raise ScheduleError('; '.join(problems))
+
+        now = datetime.now().isoformat()
+        with get_connection(self.db_path) as conn:
+            conn.execute("DELETE FROM schedule_windows WHERE user = ?", (user,))
+            for w in windows:
+                conn.execute("""
+                    INSERT INTO schedule_windows
+                        (user, days, start_hour, end_hour, mode, budget_minutes,
+                         meters, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (user, w.days, w.start_hour, w.end_hour, w.mode,
+                      w.budget_minutes, w.meters, now, now))
+
+    def get_window_consumption(self, user: str, window, day: str | None = None) -> int:
+        """Seconds already spent inside this window today.
+
+        Summed from `hourly_activity` rather than stored, so it cannot drift
+        from the activity it summarizes. `meters` selects the column: gaming
+        seconds, or every tracked second.
+        """
+        from .windows import METER_ALL
+
+        day = day or date.today().isoformat()
+        column = 'total_seconds' if window.meters == METER_ALL else 'gaming_seconds'
+
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(f"""
+                SELECT COALESCE(SUM({column}), 0) FROM hourly_activity
+                WHERE user = ? AND date = ? AND hour >= ? AND hour < ?
+            """, (user, day, window.start_hour, window.end_hour)).fetchone()
+
+        return row[0]
 
     def get_all_monitored_users(self) -> list[str]:
         """Get list of all monitored users."""
