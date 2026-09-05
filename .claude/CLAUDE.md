@@ -198,6 +198,23 @@ from `HEAD` rather than the published archive, so it works before the release it
 precedes, and it fails on a namcap error — namcap exits 0 whether or not it
 found one.
 
+### Tagging needs a tty
+
+`tag.gpgsign` is true, so `git tag -a` signs, and signing launches
+`pinentry-curses`. A Claude Code session has no tty, so the tag fails with
+`gpg: signing failed: Inappropriate ioctl for device` — and so does a `!`
+command, which runs in the same place. `pinentry-qt` and `pinentry-gnome3`
+do not help over SSH: there is no display either.
+
+`gpg-agent.conf` sets `default-cache-ttl 7776000`, so entering the passphrase
+once caches it for 90 days, and gpg stops launching pinentry entirely. Prime it
+from a shell that has a tty — suspend the session with Ctrl+Z, run
+`echo priming | gpg --clearsign > /dev/null`, then `fg`. Tagging works from
+inside the session until the cache expires.
+
+Do not work around this by creating an unsigned tag. Every `v*` tag here is
+signed, and a pushed tag is awkward to replace once arch-repo has read it.
+
 ### `PKGBUILD-git` is not published
 
 This repository carries one, but no `playtimed-git` package exists on the AUR
