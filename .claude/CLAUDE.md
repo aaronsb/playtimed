@@ -198,19 +198,24 @@ from `HEAD` rather than the published archive, so it works before the release it
 precedes, and it fails on a namcap error — namcap exits 0 whether or not it
 found one.
 
-### Tagging needs a tty
+### Tagging needs a display or a primed agent
 
-`tag.gpgsign` is true, so `git tag -a` signs, and signing launches
-`pinentry-curses`. A Claude Code session has no tty, so the tag fails with
-`gpg: signing failed: Inappropriate ioctl for device` — and so does a `!`
-command, which runs in the same place. `pinentry-qt` and `pinentry-gnome3`
-do not help over SSH: there is no display either.
+`tag.gpgsign` is true, so `git tag -a` signs, and signing needs a pinentry that
+can reach the operator. A Claude Code session has no tty, so what decides the
+outcome is whether a graphical pinentry can run:
+
+| Session | Result |
+|---|---|
+| Local, `DISPLAY` or `WAYLAND_DISPLAY` set | Signs — pinentry prompts on the desktop |
+| Over SSH, no display | Fails: `gpg: signing failed: Inappropriate ioctl for device` |
+
+A `!` command does not rescue the SSH case; it runs in the same tty-less place.
 
 `gpg-agent.conf` sets `default-cache-ttl 7776000`, so entering the passphrase
-once caches it for 90 days, and gpg stops launching pinentry entirely. Prime it
-from a shell that has a tty — suspend the session with Ctrl+Z, run
-`echo priming | gpg --clearsign > /dev/null`, then `fg`. Tagging works from
-inside the session until the cache expires.
+once caches it for 90 days and gpg stops launching pinentry at all. When
+working over SSH, prime the agent from a shell that has a tty — suspend the
+session with Ctrl+Z, run `echo priming | gpg --clearsign > /dev/null`, then
+`fg` — and tagging works from inside the session until the cache expires.
 
 Do not work around this by creating an unsigned tag. Every `v*` tag here is
 signed, and a pushed tag is awkward to replace once arch-repo has read it.
