@@ -22,8 +22,9 @@ import yaml
 
 from .browser import BrowserMonitor
 from .browser import policy as browser_policy
-from .db import ActivityDB, get_allowed_window, get_connection
+from .db import ActivityDB, get_connection
 from .router import MessageContext, MessageRouter
+from .windows import OPEN, RESTRICTED, resolve_mode, to_spec, window_for
 
 # Default paths
 DEFAULT_CONFIG = "/etc/playtimed/config.yaml"
@@ -426,13 +427,16 @@ class ClaudeDaemon:
         self._reload_config()
 
     def _reload_config(self):
-        """Reload daemon config from database (mode, users, discovery settings)."""
-        # Reload daemon mode
-        old_mode = self.mode
-        self.daemon_config = self.db.get_daemon_config()
-        self.mode = self.daemon_config['mode']
+        """Reload daemon config from database (users, discovery, stored mode).
 
-        # Reload discovery config
+        The running mode is not assigned here. Under ADR-004 it belongs to the
+        window covering the current hour, and `daemon_config['mode']` is the
+        override that feeds into that decision rather than the answer. Assigning
+        it directly would move the daemon to the stored mode for the rest of
+        this reload — announcing the change and writing a browser policy for it
+        — before the schedule moved it back on the same poll.
+        """
+        self.daemon_config = self.db.get_daemon_config()
         self.discovery_config = self.db.get_discovery_config()
 
         # Reload user list
@@ -448,13 +452,12 @@ class ClaudeDaemon:
         if removed:
             log.info(f"Removed users: {', '.join(removed)}")
 
-        if old_mode != self.mode:
-            log.info(f"Mode changed: {old_mode} -> {self.mode}")
-            # Notify all users about mode change via router
-            self.router.mode_change(self.mode)
+        # Users must be current before the schedule can be read from them.
+        self._apply_scheduled_mode()
 
         # Browser rules are enforced by the browser, so they have to be
         # rewritten whenever the state they derive from changes (ADR-003).
+        # A mode change already synced; this covers pattern edits.
         self._sync_browser_policy()
 
     def _sync_browser_policy(self):
@@ -884,51 +887,54 @@ class ClaudeDaemon:
         self.db.record_pid_seen(pattern_id, pid)
         log.info(f"Auto-discovered Proton game: {display_name} ({proc_name}) for {user}")
 
-    def _is_allowed_time(self, user: str) -> tuple[bool, str]:
-        """Check if current time is within allowed hours (from schedule)."""
-        schedule = self.db.get_schedule(user)
+    def _current_window(self, user: str):
+        """The window governing this user right now, or None if unscheduled."""
         now = datetime.now()
-        idx = (now.weekday() * 24) + now.hour
+        return window_for(self.db.get_windows(user), now.weekday(), now.hour)
 
-        if schedule[idx] == '1':
+    def _apply_scheduled_mode(self):
+        """Move the daemon to the mode the current window asks for (ADR-004).
+
+        Evaluated every poll rather than on reload, because the thing that
+        changes it is the clock. A transition regenerates the browser policy
+        through the same path SIGHUP uses.
+        """
+        current = [self._current_window(user) for user in self.users]
+        target = resolve_mode(current, self.daemon_config.get('mode', 'normal'))
+
+        if target == self.mode:
+            return
+
+        log.info(f"Mode changed: {self.mode} -> {target} (schedule)")
+        self.mode = target
+        self.router.mode_change(target)
+        self._sync_browser_policy()
+
+    def _is_allowed_time(self, user: str) -> tuple[bool, str]:
+        """Whether the current window permits anything beyond the always-open floor."""
+        window = self._current_window(user)
+
+        if window is None:
+            return True, ""
+        if window.mode == OPEN:
             return True, ""
 
-        return False, f"Gaming is not allowed at this time ({now.strftime('%a %H:00')})"
+        opens = self._next_open_window(user)
+        when = f", opens at {opens}" if opens else ""
+        now = datetime.now()
+        return False, f"Not allowed at this time ({now.strftime('%a %H:00')}{when})"
 
-    def _get_remaining_time(self, user: str) -> tuple[int, int]:
-        """Get remaining total and gaming time in seconds."""
-        user_config = self.config.get("users", {}).get(user, {})
-        limits = user_config.get("limits", {})
-
-        daily_total = limits.get("daily_total", 180) * 60  # to seconds
-        gaming_limit = limits.get("gaming", 120) * 60
-
-        state = self._load_user_state(user)
-
-        total_remaining = max(0, daily_total - state.total_time)
-        gaming_remaining = max(0, gaming_limit - state.gaming_time)
-
-        return total_remaining, gaming_remaining
-
-    def _send_warning_if_needed(self, user: str, gaming_remaining: int, app: str):
-        """Send warning notifications based on remaining time."""
-        state = self._load_user_state(user)
-        notifier = self._get_notifier(user)
-
-        warnings = state.warnings_sent.setdefault("gaming", [])
-        remaining_mins = gaming_remaining // 60
-
-        warning_thresholds = [(30, "WARNING_30"), (10, "WARNING_10"),
-                             (5, "WARNING_5"), (1, "WARNING_1")]
-
-        for threshold, msg_key in warning_thresholds:
-            if remaining_mins <= threshold and threshold not in warnings:
-                message = MessageTemplates.get(msg_key, app=app)
-                notifier.send("⏰ Time Check", message,
-                            urgency="critical" if threshold <= 5 else "normal")
-                warnings.append(threshold)
-                log.info(f"Sent {threshold}min warning to {user}")
-                break
+    def _next_open_window(self, user: str) -> str | None:
+        """Label of the next open window today, for the 'come back at' message."""
+        now = datetime.now()
+        windows = self.db.get_windows(user)
+        upcoming = sorted(
+            (w for w in windows
+             if w.applies_on(now.weekday())
+             and w.mode == OPEN
+             and w.start_hour > now.hour),
+            key=lambda w: w.start_hour)
+        return upcoming[0].label().split('-')[0] if upcoming else None
 
     def _kill_process(self, proc: ProcessMatch, user: str, notify: bool = True,
                        reason: str = "KILLED"):
@@ -1050,10 +1056,20 @@ class ClaudeDaemon:
             gaming_used += int(elapsed_seconds)
             total_used += int(elapsed_seconds)
 
-        # Calculate remaining time (per-day limit)
-        today_limits = self.db.get_daily_limits(user)
-        gaming_limit = today_limits[datetime.now().weekday()] * 60  # seconds
-        gaming_remaining = max(0, gaming_limit - gaming_used)
+        # Remaining time comes from the current window, not the day (ADR-004).
+        # An uncapped window has no budget to exhaust, so nothing here can end it;
+        # only its closing boundary can.
+        window = self._current_window(user)
+        gaming_capped = window is not None and window.is_capped
+        window_limit_mins = window.budget_minutes if gaming_capped else 0
+
+        if gaming_capped:
+            consumed = self.db.get_window_consumption(user, window)
+            if elapsed_seconds > 0 and was_gaming_active:
+                consumed += int(elapsed_seconds)
+            gaming_remaining = max(0, window_limit_mins * 60 - consumed)
+        else:
+            gaming_remaining = 0
         gaming_remaining_mins = gaming_remaining // 60
 
         # Check time restrictions
@@ -1077,9 +1093,8 @@ class ClaudeDaemon:
                                   category="gaming", pid=game.pid)
 
                 if not allowed:
-                    schedule = self.db.get_schedule(user)
-                    window = get_allowed_window(schedule, now.weekday())
-                    self.router.outside_hours(user, window)
+                    opens_at = self._next_open_window(user) or "tomorrow"
+                    self.router.outside_hours(user, opens_at)
                     self.db.log_event(user, "blocked_schedule", app=game.name,
                                       details=outside_reason, pid=game.pid)
                     self._kill_process(game, user, notify=False)
@@ -1115,8 +1130,8 @@ class ClaudeDaemon:
         self.active_games[user] = {g.pid: g for g in current_games}
 
         # Send warnings if gaming (flags prevent duplicates)
-        today_gaming_limit_mins = today_limits[now.weekday()]
-        if gaming_active and gaming_remaining > 0:
+        today_gaming_limit_mins = window_limit_mins
+        if gaming_active and gaming_capped and gaming_remaining > 0:
             if gaming_remaining_mins <= 30 and not warned_30:
                 self.router.time_warning(user, 30, today_gaming_limit_mins)
                 warned_30 = 1
@@ -1129,8 +1144,8 @@ class ClaudeDaemon:
                 self.router.time_warning(user, 5, today_gaming_limit_mins)
                 warned_5 = 1
 
-        # Enforce time limit
-        if gaming_active and gaming_remaining <= 0:
+        # Enforce the window budget. An uncapped window never reaches this.
+        if gaming_active and gaming_capped and gaming_remaining <= 0:
             self.router.time_expired(user, today_gaming_limit_mins)
 
             # Grace period (in-line for now, could be state-based)
@@ -1204,7 +1219,6 @@ class ClaudeDaemon:
                  f"DB size: {maint['after']['file_size_mb']:.2f} MB")
 
         self._reconcile_open_sessions()
-        self._sync_browser_policy()
 
         poll_interval = self.config["daemon"].get("poll_interval", 30)
 
@@ -1218,12 +1232,21 @@ class ClaudeDaemon:
         else:
             log.info(f"Monitoring users: {', '.join(self.users)}")
 
+        # Users must be loaded before the schedule can be consulted; this also
+        # writes the browser policy for the window the daemon is starting in.
+        self._apply_scheduled_mode()
+        self._sync_browser_policy()
+
         loop_count = 0
         while self.running:
             # Reload config every 10 loops (mode, users, discovery settings)
             loop_count += 1
             if loop_count % 10 == 0:
                 self._reload_config()
+
+            # The schedule can change the mode between reloads, so it is
+            # evaluated every poll rather than every tenth (ADR-004).
+            self._apply_scheduled_mode()
 
             for user in self.users:
                 try:
@@ -1250,32 +1273,40 @@ class ClaudeDaemon:
 
 
 def _get_user_status_row(db, user: str) -> dict:
-    """Get status data for a single user."""
-    total_used, gaming_used = db.get_time_used_today(user)
+    """Status for one user, measured against the window in force right now.
 
-    # daily_limits is the sole source of truth for per-day budget (see 31011c3).
-    # Both gaming and total measure against today's allowance; total_time is the
-    # superset (all monitored activity), gaming_time the gaming subset of it.
-    today_limits = db.get_daily_limits(user)
-    day_limit = today_limits[datetime.now().weekday()] * 60
-    gaming_limit = day_limit
-    total_limit = day_limit
+    A window is the unit a budget belongs to (ADR-004), so "used" and
+    "remaining" are counted inside the current window and reset at its
+    boundary. Total time for the day is reported alongside but caps nothing.
+    """
+    now = datetime.now()
+    window = window_for(db.get_windows(user), now.weekday(), now.hour)
+    total_used, _ = db.get_time_used_today(user)
 
-    gaming_remaining = max(0, gaming_limit - gaming_used)
-    total_remaining = max(0, total_limit - total_used)
+    used = limit = 0
+    if window is None:
+        state, label = 'unscheduled', '-'
+    else:
+        label = window.label()
+        if window.mode == RESTRICTED:
+            state = 'restricted'
+        else:
+            state = 'open'
+            used = db.get_window_consumption(user, window)
+            limit = (window.budget_minutes or 0) * 60
 
-    # Calculate percentage used
-    gaming_pct = int(gaming_used / gaming_limit * 100) if gaming_limit else 0
-    total_pct = int(total_used / total_limit * 100) if total_limit else 0
+    remaining = max(0, limit - used) if limit else 0
+    pct = int(used / limit * 100) if limit else 0
 
     return {
         'user': user,
-        'gaming_used': format_duration(gaming_used),
-        'gaming_remaining': format_duration(gaming_remaining),
-        'gaming_pct': gaming_pct,
+        'window': label,
+        'state': state,
+        'capped': bool(limit),
+        'used': format_duration(used),
+        'remaining': format_duration(remaining) if limit else 'uncapped',
+        'pct': pct,
         'total_used': format_duration(total_used),
-        'total_remaining': format_duration(total_remaining),
-        'total_pct': total_pct,
     }
 
 
@@ -1319,27 +1350,41 @@ def cmd_status(args):
 
     print(Colors.header("📊 Screen Time Status") + f" - {date.today().isoformat()}")
     print()
-    print(f"{Colors.bold('User'):<20} {Colors.bold('Gaming'):<12} {'Progress':<14} {Colors.bold('Total'):<12} {'Progress':<14}")
-    print(Colors.dim("─" * 70))
+    print(f"{Colors.bold('User'):<20} {Colors.bold('Window'):<14} "
+          f"{Colors.bold('Rule'):<12} {Colors.bold('Used'):<12} {'Progress':<14}")
+    print(Colors.dim("─" * 76))
 
-    for u in users:
-        row = _get_user_status_row(db, u)
-        gaming_bar = _progress_bar(row['gaming_pct'])
-        total_bar = _progress_bar(row['total_pct'])
+    rows = [_get_user_status_row(db, u) for u in users]
 
-        # Color percentage based on usage
-        g_pct = row['gaming_pct']
-        t_pct = row['total_pct']
-        g_pct_str = Colors.error(f"{g_pct:>3}%") if g_pct >= 90 else Colors.warn(f"{g_pct:>3}%") if g_pct >= 70 else f"{g_pct:>3}%"
-        t_pct_str = Colors.error(f"{t_pct:>3}%") if t_pct >= 90 else Colors.warn(f"{t_pct:>3}%") if t_pct >= 70 else f"{t_pct:>3}%"
+    for row in rows:
+        if row['state'] == 'restricted':
+            rule = Colors.warn('IXL only')
+            bar, pct_str = '', ''
+        elif not row['capped']:
+            rule = Colors.ok('uncapped')
+            bar, pct_str = '', ''
+        else:
+            rule = 'capped'
+            pct = row['pct']
+            bar = _progress_bar(pct)
+            pct_str = (Colors.error(f"{pct:>3}%") if pct >= 90
+                       else Colors.warn(f"{pct:>3}%") if pct >= 70
+                       else f"{pct:>3}%")
 
-        print(f"{Colors.bold(row['user']):<20} {row['gaming_used']:<12} {gaming_bar} {g_pct_str}  {row['total_used']:<12} {total_bar} {t_pct_str}")
+        print(f"{Colors.bold(row['user']):<20} {row['window']:<14} "
+              f"{rule:<12} {row['used']:<12} {bar} {pct_str}")
 
     print()
-    print(Colors.dim("Remaining:"))
-    for u in users:
-        row = _get_user_status_row(db, u)
-        print(f"  {row['user']}: Gaming {Colors.ok(row['gaming_remaining'])}, Total {Colors.ok(row['total_remaining'])}")
+    print(Colors.dim("This window:"))
+    for row in rows:
+        if row['state'] == 'restricted':
+            print(f"  {row['user']}: {row['window']} — restricted to the "
+                  f"always-allowed sites")
+        elif not row['capped']:
+            print(f"  {row['user']}: {row['window']} — {Colors.ok('no time cap')}")
+        else:
+            print(f"  {row['user']}: {row['window']} — "
+                  f"{Colors.ok(row['remaining'])} remaining")
 
 
 def cmd_mode(args):
@@ -1750,409 +1795,126 @@ def cmd_heatmap(args):
         print()
 
 
-def cmd_schedule(args):
-    """Show schedule grid for a user."""
-    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+
+def _open_db_or_exit(db_path: str, hint: str):
     try:
-        db = ActivityDB(db_path)
+        return ActivityDB(db_path)
     except Exception:
         print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        print(f"Try: sudo playtimed {hint}", file=sys.stderr)
         sys.exit(1)
 
-    user = getattr(args, 'user', None)
-    if user:
-        users = [user]
-    else:
-        users = db.get_all_monitored_users()
-        if not users:
-            print("No monitored users configured.")
-            return
 
-    for i, u in enumerate(users):
-        limits = db.get_user_limits(u)
-        if not limits:
-            print(f"No limits configured for {u}")
+def cmd_windows(args):
+    """Show the window schedule for a user (ADR-004)."""
+    from .windows import DAY_NAMES, describe, to_spec
+
+    db = _open_db_or_exit(getattr(args, 'db', DEFAULT_DB_PATH), "windows")
+
+    user = getattr(args, 'user', None) or getattr(args, 'username', None)
+    users = [user] if user else db.get_all_monitored_users()
+    if not users:
+        print("No monitored users configured.")
+        return
+
+    now = datetime.now()
+
+    for u in users:
+        windows = db.get_windows(u)
+        print(Colors.header(f"🗓  Windows for {u}"))
+        if not windows:
+            print(Colors.warn("  none set — every hour is unscheduled"))
+            print()
             continue
 
-        if i > 0:
-            print()
+        seen = set()
+        for day in range(7):
+            todays = tuple(sorted(
+                (w for w in windows if w.applies_on(day)),
+                key=lambda w: w.start_hour))
+            if todays in seen:
+                continue
+            seen.add(todays)
 
-        schedule = db.get_schedule(u)
+            same = [DAY_NAMES[d] for d in range(7)
+                    if tuple(sorted((w for w in windows if w.applies_on(d)),
+                                    key=lambda w: w.start_hour)) == todays]
+            print(f"  {Colors.bold(', '.join(same))}")
+            for w, line in zip(todays, describe(windows, day), strict=True):
+                current = w.covers(now.weekday(), now.hour)
+                marker = Colors.ok('  ← now') if current else ''
+                print(f"    {line}{marker}")
 
-        daily_limits = db.get_daily_limits(u)
-
-        print(Colors.header(f"━━━ {u} ━━━"))
+        print()
+        print(Colors.dim(f"  spec: {to_spec(windows)}"))
         print()
 
-        _print_schedule_grid(schedule, daily_limits)
 
+def cmd_windows_set(args):
+    """Replace a user's windows from a spec string."""
+    from .windows import ScheduleError, parse_spec, to_spec
 
-def _print_schedule_grid(schedule: str, daily_limits: list[int] | None = None):
-    """Print a 7×24 schedule grid with CP437 box-drawing characters.
+    require_root("windows set")
+    db = _open_db_or_exit(getattr(args, 'db', DEFAULT_DB_PATH), "windows set")
 
-    Renders the schedule as a bordered grid with shade characters and
-    an optional daily limit column:
-
-        ┌───┬───┬───┬─── ... ───┐
-    Mon │░░░│░░░│▓▓▓│▓▓▓ ... ░░░│  120 min
-        ├───┼───┼───┼─── ... ───┤
-    Tue │░░░│░░░│▓▓▓│▓▓▓ ... ░░░│  120 min
-        ...
-        ╞═══╪═══╪═══╪═══ ... ═══╡
-    Sat ║░░░║▓▓▓║▓▓▓║▓▓▓ ... ░░░║  180 min
-        ╠═══╬═══╬═══╬═══ ... ═══╣
-    Sun ║░░░║▓▓▓║▓▓▓║▓▓▓ ... ░░░║  180 min
-        ╚═══╩═══╩═══╩═══ ... ═══╝
-
-    Uses single-line borders for weekdays, double-line for weekends.
-    ▓▓▓ (dark shade, green) = allowed, ░░░ (light shade, dim) = blocked.
-    """
-    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-
-    # Header row with hours
-    header = "       "
-    for h in range(24):
-        header += f"{h:02d}  "
-    if daily_limits:
-        header += " Limit"
-    print(Colors.dim(header))
-
-    # Top border
-    print("       ┌" + "───┬" * 23 + "───┐")
-
-    # Data rows
-    for day_idx in range(7):
-        is_weekend = day_idx >= 5
-        label = day_names[day_idx]
-        sep = "║" if is_weekend else "│"
-
-        row_str = f"  {label}  {sep}"
-        for h in range(24):
-            idx = (day_idx * 24) + h
-            if schedule[idx] == '1':
-                row_str += Colors.GREEN + "▓▓▓" + Colors.RESET + sep
-            else:
-                row_str += Colors.dim("░░░") + sep
-
-        if daily_limits:
-            mins = daily_limits[day_idx]
-            if mins >= 60:
-                row_str += f"  {mins // 60}h{mins % 60:02d}m"
-            else:
-                row_str += f"  {mins}m"
-        print(row_str)
-
-        # Row separator
-        if day_idx == 4:
-            print("       ╞" + "═══╪" * 23 + "═══╡")
-        elif day_idx == 5:
-            print("       ╠" + "═══╬" * 23 + "═══╣")
-        elif day_idx == 6:
-            print("       ╚" + "═══╩" * 23 + "═══╝")
-        else:
-            print("       ├" + "───┼" * 23 + "───┤")
-
-    print()
-    print(f"  {Colors.GREEN}▓▓▓{Colors.RESET} allowed  {Colors.dim('░░░')} blocked")
-    print()
-
-
-def _parse_schedule_spec(spec: str) -> list[tuple[int, int, bool]]:
-    """Parse a schedule spec into (day, hour, allowed) tuples.
-
-    Spec format: '<days> <hours> <+|->'
-    Days: mon, tue, ..., sun, or ranges: mon..fri
-    Hours: 00-23, or ranges: 16..21, or 'all'
-    Action: + (permit) or - (deny)
-
-    Examples:
-        'mon 16 +'           -> [(0, 16, True)]
-        'mon..fri 16..21 +'  -> 5 days × 6 hours = 30 tuples
-        'sat..sun all -'     -> 2 days × 24 hours = 48 tuples
-
-    Returns list of (day_index, hour, allowed) tuples.
-    """
-    from playtimed.db import DAYS
-    parts = spec.strip().split()
-    if len(parts) != 3:
-        raise ValueError(f"Invalid spec '{spec}': expected '<days> <hours> <+|->'")
-
-    day_expr, hour_expr, action = parts
-
-    # Parse action
-    if action == '+':
-        allowed = True
-    elif action == '-':
-        allowed = False
-    else:
-        raise ValueError(f"Invalid action '{action}': use + or -")
-
-    # Parse days
-    if '..' in day_expr:
-        d_start, d_end = day_expr.lower().split('..')
-        i_start = DAYS.index(d_start)
-        i_end = DAYS.index(d_end)
-        days = list(range(i_start, i_end + 1))
-    else:
-        days = [DAYS.index(day_expr.lower())]
-
-    # Parse hours
-    if hour_expr == 'all':
-        hours = list(range(24))
-    elif '..' in hour_expr:
-        h_start, h_end = hour_expr.split('..')
-        hours = list(range(int(h_start), int(h_end) + 1))
-    else:
-        hours = [int(hour_expr)]
-
-    return [(d, h, allowed) for d in days for h in hours]
-
-
-def cmd_schedule_set(args):
-    """Set schedule slots from CLI specs.
-
-    Examples:
-        playtimed schedule set anders mon 16 +
-        playtimed schedule set anders mon..fri 16..21 +,sat..sun 09..22 +
-        playtimed schedule set anders mon..sun all -
-    """
-    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
+    spec = ' '.join(args.spec)
     try:
-        db = ActivityDB(db_path)
-    except Exception:
-        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
+        windows = parse_spec(spec)
+        db.set_windows(args.username, windows)
+    except ScheduleError as e:
+        print(Colors.error(f"Invalid schedule: {e}"), file=sys.stderr)
         sys.exit(1)
 
-    user = args.username
-    limits = db.get_user_limits(user)
-    if not limits:
-        print(f"No user '{user}' configured.", file=sys.stderr)
-        sys.exit(1)
-
-    schedule = list(db.get_schedule(user))
-
-    # Join remaining args and split on commas
-    spec_str = ' '.join(args.spec)
-    specs = [s.strip() for s in spec_str.split(',')]
-
-    total_changes = 0
-    for spec in specs:
-        try:
-            changes = _parse_schedule_spec(spec)
-            for day, hour, allowed in changes:
-                idx = (day * 24) + hour
-                schedule[idx] = '1' if allowed else '0'
-                total_changes += 1
-        except (ValueError, IndexError) as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    db.set_schedule(user, ''.join(schedule))
-    print(f"Updated {total_changes} slots.")
+    print(Colors.ok(f"Set {len(windows)} windows for {args.username}"))
+    print(Colors.dim(f"  {to_spec(windows)}"))
     print()
-    _print_schedule_grid(''.join(schedule), db.get_daily_limits(user))
+    print("The daemon picks this up on its next poll.")
+    print(Colors.dim("Browser rules follow the window; run "
+                     "'playtimed browser-policy --sync' to write them now."))
 
 
-def cmd_schedule_edit(args):
-    """Interactive curses-based schedule editor.
+def cmd_windows_preset(args):
+    """Apply a named window preset."""
+    from .windows import for_user_default, to_spec
 
-    Draws a 7×24 grid with box-drawing characters. Use arrow keys
-    to move the cursor (shown as a blinking █ block), spacebar to
-    cycle paint mode (off → paint allow → paint block), and q to
-    save and quit. In paint mode, arrow keys fill cells as you move.
+    require_root("windows preset")
+    db = _open_db_or_exit(getattr(args, 'db', DEFAULT_DB_PATH), "windows preset")
 
-        ┌───┬───┬───┬─── ... ───┐
-    Mon │░░░│ █ │▓▓▓│▓▓▓ ... ░░░│   <- cursor on hour 01
-        ├───┼───┼───┼─── ... ───┤
-        ...
+    presets = {'school': for_user_default}
+    if args.preset not in presets:
+        print(Colors.error(f"Unknown preset {args.preset!r}; "
+                           f"known: {', '.join(presets)}"), file=sys.stderr)
+        sys.exit(1)
+
+    windows = presets[args.preset]()
+    db.set_windows(args.username, windows)
+    print(Colors.ok(f"Applied preset {args.preset!r} to {args.username}"))
+    print(Colors.dim(f"  {to_spec(windows)}"))
+
+
+def cmd_schedule(args):
+    """Show the schedule. Windows are what enforcement reads (ADR-004)."""
+    cmd_windows(args)
+
+
+def _legacy_schedule_removed(action: str):
+    """Refuse an edit to the grid that no longer drives anything.
+
+    The grid and `daily_limits` still exist so a downgrade finds its
+    configuration, but nothing reads them. Editing them would produce a
+    schedule that displays one thing and enforces another, which is the
+    drift ADR-003 was written to avoid.
     """
-    import curses
-    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
-    try:
-        db = ActivityDB(db_path)
-    except Exception:
-        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
-        sys.exit(1)
-
-    user = args.username
-    limits = db.get_user_limits(user)
-    if not limits:
-        print(f"No user '{user}' configured.", file=sys.stderr)
-        sys.exit(1)
-
-    schedule = list(db.get_schedule(user))
-    daily_limits = db.get_daily_limits(user)
-    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-
-    def editor(stdscr):
-        curses.curs_set(0)
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_GREEN, -1)   # allowed
-        curses.init_pair(2, curses.COLOR_WHITE, -1)    # blocked (dim)
-        curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)  # cursor
-        curses.init_pair(4, curses.COLOR_YELLOW, -1)   # limit highlight
-
-        # Check terminal size — grid needs at least 112 cols × 21 rows
-        max_y, max_x = stdscr.getmaxyx()
-        if max_x < 112 or max_y < 21:
-            curses.endwin()
-            print(f"Terminal too small ({max_x}x{max_y}). "
-                  f"Schedule editor needs at least 112 columns and 21 rows.",
-                  file=sys.stderr)
-            return False
-
-        cur_day = 0
-        cur_hour = 0  # 0-23 = schedule hours, 24 = limit column
-        painting = None  # None = not painting, '1' = painting allowed, '0' = painting blocked
-        limit_input = ""  # digit buffer when editing limit column
-
-        while True:
-            stdscr.clear()
-            stdscr.addstr(0, 0, f"Schedule Editor: {user}", curses.A_BOLD)
-            stdscr.addstr(0, 25, "Arrows:move  Enter:toggle  Space:paint  +/-:limit  q:save  Esc:cancel", curses.A_DIM)
-            on_limit = (cur_hour == 24)
-
-            # Header row
-            header = "       "
-            for h in range(24):
-                header += f"{h:02d}  "
-            header += "  Limit"
-            stdscr.addstr(2, 0, header, curses.A_DIM)
-
-            # Top border
-            stdscr.addstr(3, 0, "       ┌" + "───┬" * 23 + "───┐")
-
-            for day_idx in range(7):
-                is_weekend = day_idx >= 5
-                row_y = 4 + (day_idx * 2)
-                sep = "║" if is_weekend else "│"
-
-                stdscr.addstr(row_y, 0, f"  {day_names[day_idx]}  {sep}")
-                for h in range(24):
-                    idx = (day_idx * 24) + h
-                    col_x = 7 + (h * 4) + 1  # after label and first sep
-                    is_cursor = (day_idx == cur_day and h == cur_hour)
-
-                    if is_cursor:
-                        stdscr.addstr(row_y, col_x, " █ ", curses.color_pair(3) | curses.A_BLINK)
-                    elif schedule[idx] == '1':
-                        stdscr.addstr(row_y, col_x, "▓▓▓", curses.color_pair(1))
-                    else:
-                        stdscr.addstr(row_y, col_x, "░░░", curses.A_DIM)
-                    stdscr.addstr(row_y, col_x + 3, sep)
-
-                # Daily limit column
-                limit_x = 7 + (24 * 4) + 2
-                is_limit_cursor = (day_idx == cur_day and on_limit)
-                if is_limit_cursor and limit_input:
-                    limit_str = f" {limit_input:>4s}▏"
-                elif is_limit_cursor:
-                    mins = daily_limits[day_idx]
-                    limit_str = f"[{mins:>4d}]"
-                else:
-                    mins = daily_limits[day_idx]
-                    limit_str = f" {mins:>4d} "
-                attr = curses.color_pair(4) | curses.A_BOLD if is_limit_cursor else curses.A_DIM
-                stdscr.addstr(row_y, limit_x, limit_str, attr)
-
-                # Row separator
-                sep_y = row_y + 1
-                if day_idx == 4:
-                    stdscr.addstr(sep_y, 0, "       ╞" + "═══╪" * 23 + "═══╡")
-                elif day_idx == 5:
-                    stdscr.addstr(sep_y, 0, "       ╠" + "═══╬" * 23 + "═══╣")
-                elif day_idx == 6:
-                    stdscr.addstr(sep_y, 0, "       ╚" + "═══╩" * 23 + "═══╝")
-                else:
-                    stdscr.addstr(sep_y, 0, "       ├" + "───┼" * 23 + "───┤")
-
-            # Legend
-            info_y = 4 + (7 * 2) + 1
-            if on_limit:
-                mode_str = "  LIMIT: type minutes, ENTER confirm, +/- by 15"
-            elif painting == '1':
-                mode_str = "  MODE: PAINT ALLOW ▓"
-            elif painting == '0':
-                mode_str = "  MODE: PAINT BLOCK ░"
-            else:
-                mode_str = "  MODE: single toggle"
-            stdscr.addstr(info_y, 0, "  ←↑↓→ navigate  ENTER toggle  SPACE paint mode  q save  ESC cancel")
-            stdscr.addstr(info_y + 1, 0, mode_str)
-
-            stdscr.refresh()
-
-            key = stdscr.getch()
-            if key == ord('q') and not limit_input:
-                return True  # save
-            elif key == 27:  # ESC
-                if limit_input:
-                    limit_input = ""  # cancel limit edit
-                else:
-                    return False  # cancel editor
-
-            # Limit column: digit entry
-            elif on_limit and chr(key).isdigit() if 0 <= key <= 255 else False:
-                limit_input += chr(key)
-                if len(limit_input) > 4:
-                    limit_input = limit_input[-4:]
-            elif on_limit and key in (curses.KEY_BACKSPACE, 127, 8):
-                limit_input = limit_input[:-1]
-            elif on_limit and key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
-                if limit_input:
-                    val = int(limit_input)
-                    daily_limits[cur_day] = min(1440, max(0, val))
-                    limit_input = ""
-            elif on_limit and (key == ord('+') or key == ord('=')):
-                limit_input = ""
-                daily_limits[cur_day] = min(1440, daily_limits[cur_day] + 15)
-            elif on_limit and (key == ord('-') or key == ord('_')):
-                limit_input = ""
-                daily_limits[cur_day] = max(0, daily_limits[cur_day] - 15)
-
-            # Schedule grid controls
-            elif not on_limit and key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
-                idx = (cur_day * 24) + cur_hour
-                schedule[idx] = '0' if schedule[idx] == '1' else '1'
-            elif not on_limit and key == ord(' '):
-                if painting is None:
-                    painting = '1'
-                    schedule[(cur_day * 24) + cur_hour] = '1'
-                elif painting == '1':
-                    painting = '0'
-                    schedule[(cur_day * 24) + cur_hour] = '0'
-                else:
-                    painting = None
-
-            # Navigation (both grid and limit)
-            elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT):
-                # Commit any pending limit input on nav
-                if limit_input:
-                    val = int(limit_input)
-                    daily_limits[cur_day] = min(1440, max(0, val))
-                    limit_input = ""
-                if key == curses.KEY_UP:
-                    cur_day = (cur_day - 1) % 7
-                elif key == curses.KEY_DOWN:
-                    cur_day = (cur_day + 1) % 7
-                elif key == curses.KEY_LEFT:
-                    cur_hour = max(0, cur_hour - 1)
-                elif key == curses.KEY_RIGHT:
-                    cur_hour = min(24, cur_hour + 1)
-                # Paint as we move if in a paint mode (grid only)
-                if painting is not None and cur_hour < 24:
-                    schedule[(cur_day * 24) + cur_hour] = painting
-                # Exit paint mode when entering limit column
-                if cur_hour == 24:
-                    painting = None
-
-    save = curses.wrapper(editor)
-    if save:
-        db.set_schedule(user, ''.join(schedule))
-        db.set_daily_limits(user, daily_limits)
-        print("Schedule saved.")
-    else:
-        print("Cancelled.")
+    print(Colors.error(f"'schedule {action}' no longer changes what is enforced."),
+          file=sys.stderr)
+    print(file=sys.stderr)
+    print("Schedules are windows now (ADR-004). Use:", file=sys.stderr)
+    print(Colors.info("  playtimed windows set <user> "
+                      "'mon-fri 0-15 restricted; mon-fri 15-18 open:60'"),
+          file=sys.stderr)
+    print(Colors.info("  playtimed windows preset <user> school"), file=sys.stderr)
+    print(Colors.info("  playtimed windows show <user>"), file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_schedule_export(args):
@@ -2175,65 +1937,9 @@ def cmd_schedule_export(args):
         limits = db.get_user_limits(u)
         if not limits:
             continue
-        data[u] = {
-            "schedule": db.get_schedule(u),
-            "daily_limits": db.get_daily_limits(u),
-        }
+        data[u] = {"windows": to_spec(db.get_windows(u))}
 
     print(json.dumps(data, indent=2))
-
-
-def cmd_schedule_import(args):
-    """Import schedules from JSON file with validation."""
-    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
-    try:
-        db = ActivityDB(db_path)
-    except Exception:
-        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        with open(args.file) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError) as e:
-        print(f"Error reading {args.file}: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    if not isinstance(data, dict):
-        print("Error: Expected JSON object with usernames as keys.", file=sys.stderr)
-        sys.exit(1)
-
-    errors = []
-    for user, entry in data.items():
-        if not isinstance(entry, dict) or 'schedule' not in entry:
-            errors.append(f"  {user}: missing 'schedule' key")
-            continue
-        sched = entry['schedule']
-        if len(sched) != 168:
-            errors.append(f"  {user}: schedule length {len(sched)}, expected 168")
-            continue
-        if not all(c in '01' for c in sched):
-            errors.append(f"  {user}: schedule contains invalid characters (expected only 0/1)")
-            continue
-        if 'daily_limits' in entry:
-            dl = entry['daily_limits']
-            if not isinstance(dl, list) or len(dl) != 7 or not all(isinstance(x, int) and x >= 0 for x in dl):
-                errors.append(f"  {user}: daily_limits must be list of 7 non-negative integers")
-                continue
-        if not db.get_user_limits(user):
-            errors.append(f"  {user}: user not found in database")
-
-    if errors:
-        print("Validation errors:", file=sys.stderr)
-        for e in errors:
-            print(e, file=sys.stderr)
-        sys.exit(1)
-
-    for user, entry in data.items():
-        db.set_schedule(user, entry['schedule'])
-        if 'daily_limits' in entry:
-            db.set_daily_limits(user, entry['daily_limits'])
-        print(f"Imported schedule for {user}")
 
 
 def format_runtime(seconds: int) -> str:
@@ -2771,6 +2477,27 @@ Examples:
     # Allow bare 'schedule' and 'schedule <user>' to show the grid
     schedule_parser.add_argument("user", nargs="?", help="User to check (default: all)")
 
+    # Window schedule command (ADR-004)
+    windows_parser = subparsers.add_parser(
+        "windows", help="View or set window schedules")
+    windows_sub = windows_parser.add_subparsers(dest="action")
+
+    windows_show = windows_sub.add_parser("show", help="Show windows (default)")
+    windows_show.add_argument("user", nargs="?", help="User (default: all)")
+
+    windows_set = windows_sub.add_parser("set", help="Replace a user's windows")
+    windows_set.add_argument("username", help="Username")
+    windows_set.add_argument(
+        "spec", nargs="+",
+        help="'<days> <start>-<end> <mode>[:budget][/all]', semicolon-separated. "
+             "Example: 'mon-fri 0-15 restricted; mon-fri 15-18 open:60'")
+
+    windows_preset = windows_sub.add_parser("preset", help="Apply a named preset")
+    windows_preset.add_argument("username", help="Username")
+    windows_preset.add_argument("preset", choices=["school"], help="Preset name")
+
+    windows_parser.add_argument("user", nargs="?", help="User (default: all)")
+
     # Mode command
     mode_parser = subparsers.add_parser("mode", help="View or set daemon mode")
     mode_parser.add_argument("set_mode", nargs="?", choices=["normal", "passthrough", "strict"],
@@ -2893,16 +2620,20 @@ Examples:
         cmd_heatmap(args)
     elif args.command == "schedule":
         action = getattr(args, 'action', None)
-        if action == "set":
-            cmd_schedule_set(args)
-        elif action == "edit":
-            cmd_schedule_edit(args)
+        if action in ("set", "edit", "import"):
+            _legacy_schedule_removed(action)
         elif action == "export":
             cmd_schedule_export(args)
-        elif action == "import":
-            cmd_schedule_import(args)
         else:
             cmd_schedule(args)
+    elif args.command == "windows":
+        action = getattr(args, 'action', None)
+        if action == "set":
+            cmd_windows_set(args)
+        elif action == "preset":
+            cmd_windows_preset(args)
+        else:
+            cmd_windows(args)
     elif args.command == "maintenance":
         cmd_maintenance(args)
     elif args.command == "mode":

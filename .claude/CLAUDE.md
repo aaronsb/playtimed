@@ -9,7 +9,8 @@
 - [x] SQLite database for metrics, patterns, and config
 - [x] Three enforcement modes: `normal`, `passthrough`, `strict` (allowlist only)
 - [x] Process discovery workflow — promote, ignore, disallow
-- [x] Per-hour schedule grid (7x24) with a curses editor, and per-day limits
+- [x] Window schedules — hours tile the week, each window carrying a mode
+      and an optional budget scoped to that window (ADR-004)
 - [x] Browser domain tracking for Chrome and Firefox via window titles (ADR-001)
 - [x] Browser managed-policy generation — the browser enforces URL rules from
       the domains in the database (ADR-003)
@@ -24,6 +25,8 @@
 - [ ] Web dashboard for parent monitoring
 - [ ] Login-time greeting notification
 - [ ] Decomposing `main.py`, still a ~2900-line monolith (ADR-002, proposed)
+- [ ] A curses editor for windows — the old grid editor was removed with
+      the grid it edited, and `windows set` takes a spec string instead
 
 ## The Vibe
 
@@ -79,7 +82,8 @@ Instead of boring parental control software, we're building something with perso
 pacman -S playtimed        # or: yay -S playtimed
 
 # Configure
-playtimed user add anders --gaming-limit 120 --daily-total 180
+playtimed user add anders
+playtimed windows preset anders school
 
 # Start
 systemctl enable --now playtimed
@@ -101,6 +105,15 @@ playtimed user add anders --gaming-limit 120 --weekday-start 16:00 --weekday-end
 playtimed patterns list
 playtimed patterns add "factorio" "Factorio" gaming --cpu-threshold 10
 playtimed maintenance --events-days 14
+
+# Schedules are windows: '<days> <start>-<end> <mode>[:budget][/all]',
+# semicolon-separated. Hours are 24-hour and the end is exclusive.
+playtimed windows show anders
+playtimed windows set anders 'mon-fri 0-15 restricted; mon-fri 15-18 open:60; \
+                              mon-fri 18-22 open; mon-fri 22-24 restricted'
+
+# Unlisted hours fill as restricted, and a set that does not tile is refused.
+playtimed windows preset anders school
 ```
 
 ## Personality Guidelines

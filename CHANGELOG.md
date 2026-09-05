@@ -5,6 +5,34 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-04
+
+### Added
+- **Window schedules** (ADR-004) — a user's allowance is a set of windows, each covering a contiguous range of hours on a set of days and carrying a mode (`restricted` or `open`) and an optional budget. Windows tile the week: for every day they partition hours 0-24 with no gaps and no overlaps, so no hour falls under two rules or none. An hour left unruled is filled as `restricted`, because the two readings of an unruled hour are the lockdown and its absence
+- Budgets are scoped to their window. "One hour of games between three and six, then an uncapped evening" is now expressible; under per-day limits the cap followed the user into the evening that was specified as uncapped
+- Each window chooses what its budget meters: `gaming` counts game processes and gaming-category browser domains, `all` counts every tracked second. The default is `gaming`, so productive and educational time stays free
+- The daemon derives its enforcement mode from the window covering the current hour and re-evaluates every poll, since the thing that changes it is the clock. A transition regenerates the browser policy through the path SIGHUP already used, so ADR-003 enforcement follows the schedule with no new mechanism
+- `playtimed windows show|set|preset`. `windows set` takes a spec — `mon-fri 0-15 restricted; mon-fri 15-18 open:60` — and refuses a set that does not tile, leaving the previous schedule in force
+- Window spend is summed from `hourly_activity` over the hours a window covers rather than kept in a counter, so it cannot drift from the activity it summarizes and has no reset to get wrong
+
+### Changed
+- `playtimed status` reports the window in force, what has been spent inside it, and what remains, in place of a per-day gaming and total figure
+- `playtimed schedule` and `schedule view` render windows — the command shows what is actually enforced
+- `schedule export` emits a spec string that `windows set` accepts, making an export a restorable backup rather than a description
+- `daemon_config.mode` keeps one job as a manual override. `passthrough` outranks the schedule, which is what suspending enforcement has to mean; `normal` and `strict` are superseded by the window each poll
+- When monitored users hold different modes at the same moment, the most restrictive wins. Chrome's managed policy is machine-wide (ADR-003) and can only express one answer for the machine
+
+### Removed
+- `daily_total` is no longer an enforcement input. Under a window schedule it bound in the middle of a window specified as uncapped, which made "no time cap" false as written. Total time is still recorded in `daily_summary`; nothing caps it. A total cap is now expressed as a window budget with `meters = all`
+- `schedule set`, `schedule edit`, and `schedule import` refuse and name their replacement. They wrote a structure enforcement no longer reads, which would have produced a schedule that displays one thing and enforces another
+- The curses grid editor is removed rather than ported. It edits one cell per hour over `{0,1}`, and a window carries a mode, a budget, and a meter that no single cell can hold
+- `_get_remaining_time` and `_send_warning_if_needed`, both dead before this release and both computing the per-day model it retires
+
+### Migration
+- Existing schedules convert automatically. Each day's grid collapses into maximal runs, a run of `1` becoming an `open` window, and that day's `daily_limits` value lands on its first `open` window — where a per-day budget was first spendable
+- The legacy `schedule` and `daily_limits` columns are left in place and stop being read, so a downgrade to 0.5.x finds its configuration intact
+- Migration skips a user who already has windows, so operator edits survive every later pass
+
 ## [0.5.4] - 2026-09-02
 
 ### Fixed
