@@ -427,13 +427,16 @@ class ClaudeDaemon:
         self._reload_config()
 
     def _reload_config(self):
-        """Reload daemon config from database (mode, users, discovery settings)."""
-        # Reload daemon mode
-        old_mode = self.mode
-        self.daemon_config = self.db.get_daemon_config()
-        self.mode = self.daemon_config['mode']
+        """Reload daemon config from database (users, discovery, stored mode).
 
-        # Reload discovery config
+        The running mode is not assigned here. Under ADR-004 it belongs to the
+        window covering the current hour, and `daemon_config['mode']` is the
+        override that feeds into that decision rather than the answer. Assigning
+        it directly would move the daemon to the stored mode for the rest of
+        this reload — announcing the change and writing a browser policy for it
+        — before the schedule moved it back on the same poll.
+        """
+        self.daemon_config = self.db.get_daemon_config()
         self.discovery_config = self.db.get_discovery_config()
 
         # Reload user list
@@ -449,13 +452,12 @@ class ClaudeDaemon:
         if removed:
             log.info(f"Removed users: {', '.join(removed)}")
 
-        if old_mode != self.mode:
-            log.info(f"Mode changed: {old_mode} -> {self.mode}")
-            # Notify all users about mode change via router
-            self.router.mode_change(self.mode)
+        # Users must be current before the schedule can be read from them.
+        self._apply_scheduled_mode()
 
         # Browser rules are enforced by the browser, so they have to be
         # rewritten whenever the state they derive from changes (ADR-003).
+        # A mode change already synced; this covers pattern edits.
         self._sync_browser_policy()
 
     def _sync_browser_policy(self):
