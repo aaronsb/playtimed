@@ -24,7 +24,7 @@ from .browser import BrowserMonitor
 from .browser import policy as browser_policy
 from .db import ActivityDB, get_connection
 from .router import MessageContext, MessageRouter
-from .windows import OPEN, RESTRICTED, resolve_mode, window_for
+from .windows import OPEN, RESTRICTED, resolve_mode, to_spec, window_for
 
 # Default paths
 DEFAULT_CONFIG = "/etc/playtimed/config.yaml"
@@ -1891,408 +1891,28 @@ def cmd_windows_preset(args):
 
 
 def cmd_schedule(args):
-    """Show schedule grid for a user."""
-    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
-    try:
-        db = ActivityDB(db_path)
-    except Exception:
-        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
-        sys.exit(1)
-
-    user = getattr(args, 'user', None)
-    if user:
-        users = [user]
-    else:
-        users = db.get_all_monitored_users()
-        if not users:
-            print("No monitored users configured.")
-            return
-
-    for i, u in enumerate(users):
-        limits = db.get_user_limits(u)
-        if not limits:
-            print(f"No limits configured for {u}")
-            continue
-
-        if i > 0:
-            print()
-
-        schedule = db.get_schedule(u)
-
-        daily_limits = db.get_daily_limits(u)
-
-        print(Colors.header(f"━━━ {u} ━━━"))
-        print()
-
-        _print_schedule_grid(schedule, daily_limits)
+    """Show the schedule. Windows are what enforcement reads (ADR-004)."""
+    cmd_windows(args)
 
 
-def _print_schedule_grid(schedule: str, daily_limits: list[int] | None = None):
-    """Print a 7×24 schedule grid with CP437 box-drawing characters.
+def _legacy_schedule_removed(action: str):
+    """Refuse an edit to the grid that no longer drives anything.
 
-    Renders the schedule as a bordered grid with shade characters and
-    an optional daily limit column:
-
-        ┌───┬───┬───┬─── ... ───┐
-    Mon │░░░│░░░│▓▓▓│▓▓▓ ... ░░░│  120 min
-        ├───┼───┼───┼─── ... ───┤
-    Tue │░░░│░░░│▓▓▓│▓▓▓ ... ░░░│  120 min
-        ...
-        ╞═══╪═══╪═══╪═══ ... ═══╡
-    Sat ║░░░║▓▓▓║▓▓▓║▓▓▓ ... ░░░║  180 min
-        ╠═══╬═══╬═══╬═══ ... ═══╣
-    Sun ║░░░║▓▓▓║▓▓▓║▓▓▓ ... ░░░║  180 min
-        ╚═══╩═══╩═══╩═══ ... ═══╝
-
-    Uses single-line borders for weekdays, double-line for weekends.
-    ▓▓▓ (dark shade, green) = allowed, ░░░ (light shade, dim) = blocked.
+    The grid and `daily_limits` still exist so a downgrade finds its
+    configuration, but nothing reads them. Editing them would produce a
+    schedule that displays one thing and enforces another, which is the
+    drift ADR-003 was written to avoid.
     """
-    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-
-    # Header row with hours
-    header = "       "
-    for h in range(24):
-        header += f"{h:02d}  "
-    if daily_limits:
-        header += " Limit"
-    print(Colors.dim(header))
-
-    # Top border
-    print("       ┌" + "───┬" * 23 + "───┐")
-
-    # Data rows
-    for day_idx in range(7):
-        is_weekend = day_idx >= 5
-        label = day_names[day_idx]
-        sep = "║" if is_weekend else "│"
-
-        row_str = f"  {label}  {sep}"
-        for h in range(24):
-            idx = (day_idx * 24) + h
-            if schedule[idx] == '1':
-                row_str += Colors.GREEN + "▓▓▓" + Colors.RESET + sep
-            else:
-                row_str += Colors.dim("░░░") + sep
-
-        if daily_limits:
-            mins = daily_limits[day_idx]
-            if mins >= 60:
-                row_str += f"  {mins // 60}h{mins % 60:02d}m"
-            else:
-                row_str += f"  {mins}m"
-        print(row_str)
-
-        # Row separator
-        if day_idx == 4:
-            print("       ╞" + "═══╪" * 23 + "═══╡")
-        elif day_idx == 5:
-            print("       ╠" + "═══╬" * 23 + "═══╣")
-        elif day_idx == 6:
-            print("       ╚" + "═══╩" * 23 + "═══╝")
-        else:
-            print("       ├" + "───┼" * 23 + "───┤")
-
-    print()
-    print(f"  {Colors.GREEN}▓▓▓{Colors.RESET} allowed  {Colors.dim('░░░')} blocked")
-    print()
-
-
-def _parse_schedule_spec(spec: str) -> list[tuple[int, int, bool]]:
-    """Parse a schedule spec into (day, hour, allowed) tuples.
-
-    Spec format: '<days> <hours> <+|->'
-    Days: mon, tue, ..., sun, or ranges: mon..fri
-    Hours: 00-23, or ranges: 16..21, or 'all'
-    Action: + (permit) or - (deny)
-
-    Examples:
-        'mon 16 +'           -> [(0, 16, True)]
-        'mon..fri 16..21 +'  -> 5 days × 6 hours = 30 tuples
-        'sat..sun all -'     -> 2 days × 24 hours = 48 tuples
-
-    Returns list of (day_index, hour, allowed) tuples.
-    """
-    from playtimed.db import DAYS
-    parts = spec.strip().split()
-    if len(parts) != 3:
-        raise ValueError(f"Invalid spec '{spec}': expected '<days> <hours> <+|->'")
-
-    day_expr, hour_expr, action = parts
-
-    # Parse action
-    if action == '+':
-        allowed = True
-    elif action == '-':
-        allowed = False
-    else:
-        raise ValueError(f"Invalid action '{action}': use + or -")
-
-    # Parse days
-    if '..' in day_expr:
-        d_start, d_end = day_expr.lower().split('..')
-        i_start = DAYS.index(d_start)
-        i_end = DAYS.index(d_end)
-        days = list(range(i_start, i_end + 1))
-    else:
-        days = [DAYS.index(day_expr.lower())]
-
-    # Parse hours
-    if hour_expr == 'all':
-        hours = list(range(24))
-    elif '..' in hour_expr:
-        h_start, h_end = hour_expr.split('..')
-        hours = list(range(int(h_start), int(h_end) + 1))
-    else:
-        hours = [int(hour_expr)]
-
-    return [(d, h, allowed) for d in days for h in hours]
-
-
-def cmd_schedule_set(args):
-    """Set schedule slots from CLI specs.
-
-    Examples:
-        playtimed schedule set anders mon 16 +
-        playtimed schedule set anders mon..fri 16..21 +,sat..sun 09..22 +
-        playtimed schedule set anders mon..sun all -
-    """
-    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
-    try:
-        db = ActivityDB(db_path)
-    except Exception:
-        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
-        sys.exit(1)
-
-    user = args.username
-    limits = db.get_user_limits(user)
-    if not limits:
-        print(f"No user '{user}' configured.", file=sys.stderr)
-        sys.exit(1)
-
-    schedule = list(db.get_schedule(user))
-
-    # Join remaining args and split on commas
-    spec_str = ' '.join(args.spec)
-    specs = [s.strip() for s in spec_str.split(',')]
-
-    total_changes = 0
-    for spec in specs:
-        try:
-            changes = _parse_schedule_spec(spec)
-            for day, hour, allowed in changes:
-                idx = (day * 24) + hour
-                schedule[idx] = '1' if allowed else '0'
-                total_changes += 1
-        except (ValueError, IndexError) as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    db.set_schedule(user, ''.join(schedule))
-    print(f"Updated {total_changes} slots.")
-    print()
-    _print_schedule_grid(''.join(schedule), db.get_daily_limits(user))
-
-
-def cmd_schedule_edit(args):
-    """Interactive curses-based schedule editor.
-
-    Draws a 7×24 grid with box-drawing characters. Use arrow keys
-    to move the cursor (shown as a blinking █ block), spacebar to
-    cycle paint mode (off → paint allow → paint block), and q to
-    save and quit. In paint mode, arrow keys fill cells as you move.
-
-        ┌───┬───┬───┬─── ... ───┐
-    Mon │░░░│ █ │▓▓▓│▓▓▓ ... ░░░│   <- cursor on hour 01
-        ├───┼───┼───┼─── ... ───┤
-        ...
-    """
-    import curses
-    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
-    try:
-        db = ActivityDB(db_path)
-    except Exception:
-        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
-        sys.exit(1)
-
-    user = args.username
-    limits = db.get_user_limits(user)
-    if not limits:
-        print(f"No user '{user}' configured.", file=sys.stderr)
-        sys.exit(1)
-
-    schedule = list(db.get_schedule(user))
-    daily_limits = db.get_daily_limits(user)
-    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-
-    def editor(stdscr):
-        curses.curs_set(0)
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_GREEN, -1)   # allowed
-        curses.init_pair(2, curses.COLOR_WHITE, -1)    # blocked (dim)
-        curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)  # cursor
-        curses.init_pair(4, curses.COLOR_YELLOW, -1)   # limit highlight
-
-        # Check terminal size — grid needs at least 112 cols × 21 rows
-        max_y, max_x = stdscr.getmaxyx()
-        if max_x < 112 or max_y < 21:
-            curses.endwin()
-            print(f"Terminal too small ({max_x}x{max_y}). "
-                  f"Schedule editor needs at least 112 columns and 21 rows.",
-                  file=sys.stderr)
-            return False
-
-        cur_day = 0
-        cur_hour = 0  # 0-23 = schedule hours, 24 = limit column
-        painting = None  # None = not painting, '1' = painting allowed, '0' = painting blocked
-        limit_input = ""  # digit buffer when editing limit column
-
-        while True:
-            stdscr.clear()
-            stdscr.addstr(0, 0, f"Schedule Editor: {user}", curses.A_BOLD)
-            stdscr.addstr(0, 25, "Arrows:move  Enter:toggle  Space:paint  +/-:limit  q:save  Esc:cancel", curses.A_DIM)
-            on_limit = (cur_hour == 24)
-
-            # Header row
-            header = "       "
-            for h in range(24):
-                header += f"{h:02d}  "
-            header += "  Limit"
-            stdscr.addstr(2, 0, header, curses.A_DIM)
-
-            # Top border
-            stdscr.addstr(3, 0, "       ┌" + "───┬" * 23 + "───┐")
-
-            for day_idx in range(7):
-                is_weekend = day_idx >= 5
-                row_y = 4 + (day_idx * 2)
-                sep = "║" if is_weekend else "│"
-
-                stdscr.addstr(row_y, 0, f"  {day_names[day_idx]}  {sep}")
-                for h in range(24):
-                    idx = (day_idx * 24) + h
-                    col_x = 7 + (h * 4) + 1  # after label and first sep
-                    is_cursor = (day_idx == cur_day and h == cur_hour)
-
-                    if is_cursor:
-                        stdscr.addstr(row_y, col_x, " █ ", curses.color_pair(3) | curses.A_BLINK)
-                    elif schedule[idx] == '1':
-                        stdscr.addstr(row_y, col_x, "▓▓▓", curses.color_pair(1))
-                    else:
-                        stdscr.addstr(row_y, col_x, "░░░", curses.A_DIM)
-                    stdscr.addstr(row_y, col_x + 3, sep)
-
-                # Daily limit column
-                limit_x = 7 + (24 * 4) + 2
-                is_limit_cursor = (day_idx == cur_day and on_limit)
-                if is_limit_cursor and limit_input:
-                    limit_str = f" {limit_input:>4s}▏"
-                elif is_limit_cursor:
-                    mins = daily_limits[day_idx]
-                    limit_str = f"[{mins:>4d}]"
-                else:
-                    mins = daily_limits[day_idx]
-                    limit_str = f" {mins:>4d} "
-                attr = curses.color_pair(4) | curses.A_BOLD if is_limit_cursor else curses.A_DIM
-                stdscr.addstr(row_y, limit_x, limit_str, attr)
-
-                # Row separator
-                sep_y = row_y + 1
-                if day_idx == 4:
-                    stdscr.addstr(sep_y, 0, "       ╞" + "═══╪" * 23 + "═══╡")
-                elif day_idx == 5:
-                    stdscr.addstr(sep_y, 0, "       ╠" + "═══╬" * 23 + "═══╣")
-                elif day_idx == 6:
-                    stdscr.addstr(sep_y, 0, "       ╚" + "═══╩" * 23 + "═══╝")
-                else:
-                    stdscr.addstr(sep_y, 0, "       ├" + "───┼" * 23 + "───┤")
-
-            # Legend
-            info_y = 4 + (7 * 2) + 1
-            if on_limit:
-                mode_str = "  LIMIT: type minutes, ENTER confirm, +/- by 15"
-            elif painting == '1':
-                mode_str = "  MODE: PAINT ALLOW ▓"
-            elif painting == '0':
-                mode_str = "  MODE: PAINT BLOCK ░"
-            else:
-                mode_str = "  MODE: single toggle"
-            stdscr.addstr(info_y, 0, "  ←↑↓→ navigate  ENTER toggle  SPACE paint mode  q save  ESC cancel")
-            stdscr.addstr(info_y + 1, 0, mode_str)
-
-            stdscr.refresh()
-
-            key = stdscr.getch()
-            if key == ord('q') and not limit_input:
-                return True  # save
-            elif key == 27:  # ESC
-                if limit_input:
-                    limit_input = ""  # cancel limit edit
-                else:
-                    return False  # cancel editor
-
-            # Limit column: digit entry
-            elif on_limit and chr(key).isdigit() if 0 <= key <= 255 else False:
-                limit_input += chr(key)
-                if len(limit_input) > 4:
-                    limit_input = limit_input[-4:]
-            elif on_limit and key in (curses.KEY_BACKSPACE, 127, 8):
-                limit_input = limit_input[:-1]
-            elif on_limit and key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
-                if limit_input:
-                    val = int(limit_input)
-                    daily_limits[cur_day] = min(1440, max(0, val))
-                    limit_input = ""
-            elif on_limit and (key == ord('+') or key == ord('=')):
-                limit_input = ""
-                daily_limits[cur_day] = min(1440, daily_limits[cur_day] + 15)
-            elif on_limit and (key == ord('-') or key == ord('_')):
-                limit_input = ""
-                daily_limits[cur_day] = max(0, daily_limits[cur_day] - 15)
-
-            # Schedule grid controls
-            elif not on_limit and key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
-                idx = (cur_day * 24) + cur_hour
-                schedule[idx] = '0' if schedule[idx] == '1' else '1'
-            elif not on_limit and key == ord(' '):
-                if painting is None:
-                    painting = '1'
-                    schedule[(cur_day * 24) + cur_hour] = '1'
-                elif painting == '1':
-                    painting = '0'
-                    schedule[(cur_day * 24) + cur_hour] = '0'
-                else:
-                    painting = None
-
-            # Navigation (both grid and limit)
-            elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT):
-                # Commit any pending limit input on nav
-                if limit_input:
-                    val = int(limit_input)
-                    daily_limits[cur_day] = min(1440, max(0, val))
-                    limit_input = ""
-                if key == curses.KEY_UP:
-                    cur_day = (cur_day - 1) % 7
-                elif key == curses.KEY_DOWN:
-                    cur_day = (cur_day + 1) % 7
-                elif key == curses.KEY_LEFT:
-                    cur_hour = max(0, cur_hour - 1)
-                elif key == curses.KEY_RIGHT:
-                    cur_hour = min(24, cur_hour + 1)
-                # Paint as we move if in a paint mode (grid only)
-                if painting is not None and cur_hour < 24:
-                    schedule[(cur_day * 24) + cur_hour] = painting
-                # Exit paint mode when entering limit column
-                if cur_hour == 24:
-                    painting = None
-
-    save = curses.wrapper(editor)
-    if save:
-        db.set_schedule(user, ''.join(schedule))
-        db.set_daily_limits(user, daily_limits)
-        print("Schedule saved.")
-    else:
-        print("Cancelled.")
+    print(Colors.error(f"'schedule {action}' no longer changes what is enforced."),
+          file=sys.stderr)
+    print(file=sys.stderr)
+    print("Schedules are windows now (ADR-004). Use:", file=sys.stderr)
+    print(Colors.info("  playtimed windows set <user> "
+                      "'mon-fri 0-15 restricted; mon-fri 15-18 open:60'"),
+          file=sys.stderr)
+    print(Colors.info("  playtimed windows preset <user> school"), file=sys.stderr)
+    print(Colors.info("  playtimed windows show <user>"), file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_schedule_export(args):
@@ -2315,65 +1935,9 @@ def cmd_schedule_export(args):
         limits = db.get_user_limits(u)
         if not limits:
             continue
-        data[u] = {
-            "schedule": db.get_schedule(u),
-            "daily_limits": db.get_daily_limits(u),
-        }
+        data[u] = {"windows": to_spec(db.get_windows(u))}
 
     print(json.dumps(data, indent=2))
-
-
-def cmd_schedule_import(args):
-    """Import schedules from JSON file with validation."""
-    db_path = getattr(args, 'db', DEFAULT_DB_PATH)
-    try:
-        db = ActivityDB(db_path)
-    except Exception:
-        print(f"Error: Cannot access database at {db_path}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        with open(args.file) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError) as e:
-        print(f"Error reading {args.file}: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    if not isinstance(data, dict):
-        print("Error: Expected JSON object with usernames as keys.", file=sys.stderr)
-        sys.exit(1)
-
-    errors = []
-    for user, entry in data.items():
-        if not isinstance(entry, dict) or 'schedule' not in entry:
-            errors.append(f"  {user}: missing 'schedule' key")
-            continue
-        sched = entry['schedule']
-        if len(sched) != 168:
-            errors.append(f"  {user}: schedule length {len(sched)}, expected 168")
-            continue
-        if not all(c in '01' for c in sched):
-            errors.append(f"  {user}: schedule contains invalid characters (expected only 0/1)")
-            continue
-        if 'daily_limits' in entry:
-            dl = entry['daily_limits']
-            if not isinstance(dl, list) or len(dl) != 7 or not all(isinstance(x, int) and x >= 0 for x in dl):
-                errors.append(f"  {user}: daily_limits must be list of 7 non-negative integers")
-                continue
-        if not db.get_user_limits(user):
-            errors.append(f"  {user}: user not found in database")
-
-    if errors:
-        print("Validation errors:", file=sys.stderr)
-        for e in errors:
-            print(e, file=sys.stderr)
-        sys.exit(1)
-
-    for user, entry in data.items():
-        db.set_schedule(user, entry['schedule'])
-        if 'daily_limits' in entry:
-            db.set_daily_limits(user, entry['daily_limits'])
-        print(f"Imported schedule for {user}")
 
 
 def format_runtime(seconds: int) -> str:
@@ -3054,14 +2618,10 @@ Examples:
         cmd_heatmap(args)
     elif args.command == "schedule":
         action = getattr(args, 'action', None)
-        if action == "set":
-            cmd_schedule_set(args)
-        elif action == "edit":
-            cmd_schedule_edit(args)
+        if action in ("set", "edit", "import"):
+            _legacy_schedule_removed(action)
         elif action == "export":
             cmd_schedule_export(args)
-        elif action == "import":
-            cmd_schedule_import(args)
         else:
             cmd_schedule(args)
     elif args.command == "windows":

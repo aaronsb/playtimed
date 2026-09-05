@@ -152,6 +152,14 @@ budget is a projection.
 `hourly_activity` buckets by hour, and a half-hour boundary would split a bucket no
 existing row can divide. Every requirement above lands on an hour boundary.
 
+**The curses grid editor is removed rather than ported.** It edited a
+168-character string over `{0,1}`, one cell per hour, and a window carries a
+mode, a budget, and a meter that no single cell can hold. Porting it is a
+rewrite, so it is left as future work and `playtimed windows set` takes a spec
+string in the meantime. `schedule set`, `schedule edit`, and `schedule import`
+now refuse and name their replacement, because a command that edits a structure
+nothing reads produces a schedule that displays one thing and enforces another.
+
 **A budget's last minute is approximate.** Consumption within the current hour is
 whatever the poll loop has accrued so far, so exhaustion is detected within a poll
 interval rather than at the second.
