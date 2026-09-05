@@ -1,6 +1,6 @@
 # ADR-004: Window Schedules with Per-Window Budgets
 
-Status: Proposed
+Status: Accepted
 Date: 2026-09-04
 Deciders: @aaron, @claude
 
