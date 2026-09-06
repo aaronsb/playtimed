@@ -5,6 +5,12 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-09-06
+
+### Fixed
+- The browser policy is rendered for the mode the schedule puts the daemon in, in place of the stored `daemon_config.mode`. Under 0.6.0 that setting became the manual override, but the policy sync still read it, so on a host whose stored mode was `strict` every transition to an open window rewrote the allowlist and kept it there. The daemon now hands the sync the mode it is running in, and the CLI (`browser-policy`, `windows set`, pattern edits, `mode`) resolves the mode from this hour's windows the same way
+- `playtimed browser-policy` shows the mode it renders and names the stored override when the two differ
+
 ## [0.6.0] - 2026-09-04
 
 ### Added
