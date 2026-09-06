@@ -134,3 +134,21 @@ class TestReloadDoesNotClobber:
 
         assert daemon.mode == 'normal'
         assert daemon.router.mode_changes == []
+
+
+class TestSyncCarriesTheLiveMode:
+    """The daemon knows its mode; the policy must be rendered for that one."""
+
+    def test_sync_passes_the_running_mode(self, daemon, monkeypatch):
+        from playtimed.browser import policy as browser_policy
+
+        calls = []
+        monkeypatch.setattr(browser_policy, 'sync',
+                            lambda db, mode=None: calls.append(mode) or [])
+        daemon.db = object()
+        daemon.mode = 'normal'
+
+        ClaudeDaemon._sync_browser_policy(daemon)
+
+        assert calls == ['normal']
+

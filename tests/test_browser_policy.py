@@ -361,3 +361,46 @@ class TestWriteChurn:
         assert len(actions) == 1
         written = json.loads((managed / 'playtimed.json').read_text())
         assert 'khanacademy.org' in written['URLAllowlist']
+
+
+class FakeDB:
+    """brick's shape: stored override strict, the current window open."""
+
+    def get_daemon_mode(self):
+        return 'strict'
+
+    def get_effective_mode(self):
+        return 'normal'
+
+    def get_browser_patterns(self, include_all_states=False):
+        return PATTERNS
+
+
+class TestSync:
+    """Which mode the regenerated policy is rendered for.
+
+    The stored mode is an override, so a host that once set it to `strict`
+    must still get a blocklist when the window is open (ADR-004). This was
+    the bug in 0.6.0: sync read the stored mode, and the transition to an
+    open window rewrote the allowlist rather than replacing it.
+    """
+
+    @pytest.fixture
+    def rendered(self, monkeypatch):
+        modes = []
+
+        def plan(mode, patterns, targets=None):
+            modes.append(mode)
+            return []
+
+        monkeypatch.setattr(policy, 'plan_policies', plan)
+        return modes
+
+    def test_unset_mode_renders_the_schedule_not_the_stored_override(self, rendered):
+        policy.sync(FakeDB())
+        assert rendered == ['normal']
+
+    def test_an_explicit_mode_is_rendered_as_given(self, rendered):
+        policy.sync(FakeDB(), 'strict')
+        assert rendered == ['strict']
+

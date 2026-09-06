@@ -358,8 +358,14 @@ def _file_matches(path: str, desired: str) -> bool:
         return False
 
 
-def sync(db) -> list[str]:
+def sync(db, mode: str | None = None) -> list[str]:
     """Regenerate every browser policy from the database. Returns action log.
+
+    `mode` is the enforcement mode to render. The daemon passes the one it is
+    running in; the CLI, which has no daemon to ask, leaves it unset and the
+    schedule's answer for this hour is used (ADR-004). Neither is the stored
+    override, which on a host that sets it to `strict` would keep the
+    allowlist in place through every open window.
 
     Managed policy is per-browser and machine-wide; there is no per-user
     equivalent. So the policy is built from every owner's domains at once, and
@@ -367,6 +373,7 @@ def sync(db) -> list[str]:
     administrator also browses, that administrator is subject to the same
     rules — the workaround is a separate machine or a separate browser.
     """
-    mode = db.get_daemon_mode()
+    if mode is None:
+        mode = db.get_effective_mode()
     patterns = db.get_browser_patterns(include_all_states=True)
     return apply_plans(plan_policies(mode, patterns))

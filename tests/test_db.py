@@ -245,6 +245,43 @@ class TestDaemonConfig:
             db.set_daemon_mode('invalid_mode')
 
 
+class TestEffectiveMode:
+    """The mode enforcement renders is the window's, with the stored value as override.
+
+    Every window here covers the whole week, so the hour the test runs in
+    does not matter and `now` is left to default.
+    """
+
+    def test_open_window_beats_a_stored_strict(self, db):
+        from playtimed.windows import parse_spec
+        db.set_user_limits('anders', enabled=1)
+        db.set_windows('anders', parse_spec('all 0-24 open'))
+        db.set_daemon_mode('strict')
+
+        assert db.get_effective_mode() == 'normal'
+
+    def test_restricted_window_beats_a_stored_normal(self, db):
+        from playtimed.windows import parse_spec
+        db.set_user_limits('anders', enabled=1)
+        db.set_windows('anders', parse_spec('all 0-24 restricted'))
+        db.set_daemon_mode('normal')
+
+        assert db.get_effective_mode() == 'strict'
+
+    def test_passthrough_outranks_the_window(self, db):
+        from playtimed.windows import parse_spec
+        db.set_user_limits('anders', enabled=1)
+        db.set_windows('anders', parse_spec('all 0-24 restricted'))
+        db.set_daemon_mode('passthrough')
+
+        assert db.get_effective_mode() == 'passthrough'
+
+    def test_nobody_scheduled_leaves_the_stored_mode(self, db):
+        db.set_daemon_mode('strict')
+
+        assert db.get_effective_mode() == 'strict'
+
+
 class TestDailySummary:
     """Tests for daily summary tracking."""
 

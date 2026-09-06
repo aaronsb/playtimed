@@ -463,7 +463,7 @@ class ClaudeDaemon:
     def _sync_browser_policy(self):
         """Regenerate browser managed-policy files from the database."""
         try:
-            for action in browser_policy.sync(self.db):
+            for action in browser_policy.sync(self.db, self.mode):
                 log.info("Browser policy: %s", action)
         except Exception as e:
             log.warning("Browser policy sync failed: %s", e)
@@ -2181,14 +2181,16 @@ def cmd_browser_policy(args):
         print(f"Error: Cannot access database at {args.db}", file=sys.stderr)
         sys.exit(1)
 
-    mode = db.get_daemon_mode()
+    mode = db.get_effective_mode()
+    stored = db.get_daemon_mode()
     patterns = db.get_browser_patterns(include_all_states=True)
     permitted, blocked = browser_policy.partition_domains(patterns)
     plans = browser_policy.plan_policies(mode, patterns)
 
     print(Colors.header("Browser Policy"))
     print()
-    print(f"  Mode:      {Colors.bold(mode)}")
+    origin = "" if mode == stored else Colors.dim(f"  (this hour's window; stored override is {stored})")
+    print(f"  Mode:      {Colors.bold(mode)}{origin}")
     print(f"  Permitted: {', '.join(permitted) if permitted else Colors.dim('none')}")
     print(f"  Blocked:   {', '.join(blocked) if blocked else Colors.dim('none')}")
     print()

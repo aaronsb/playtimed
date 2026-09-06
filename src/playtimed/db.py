@@ -1103,6 +1103,22 @@ class ActivityDB:
         """Get current daemon mode (normal, passthrough, strict)."""
         return self.get_daemon_config()['mode']
 
+    def get_effective_mode(self, now: datetime | None = None) -> str:
+        """The mode the schedule puts the daemon in at this moment (ADR-004).
+
+        The stored mode is an override that feeds this decision: `passthrough`
+        outranks every window, and `normal` or `strict` stands only for an
+        hour no monitored user has a window for. Anything that renders
+        enforcement — the browser policy above all — reads this, and reads
+        `get_daemon_mode` only to show or change the override itself.
+        """
+        from .windows import resolve_mode, window_for
+
+        now = now or datetime.now()
+        current = [window_for(self.get_windows(user), now.weekday(), now.hour)
+                   for user in self.get_all_monitored_users()]
+        return resolve_mode(current, self.get_daemon_mode())
+
     def set_daemon_mode(self, mode: str):
         """Set daemon mode. Valid values: normal, passthrough, strict."""
         if mode not in ('normal', 'passthrough', 'strict'):
