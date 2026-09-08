@@ -5,7 +5,7 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-09-08
 
 ### Added
 - **Allowances** (ADR-005) — a restricted window may grant named rations of minutes per clock hour, and a pattern draws on one by carrying its name. `mon-fri 0-16 restricted discord=5` with the Discord process and `discord.com` both attached to `discord` gives five shared minutes of Discord in every school hour, renewing with the clock
