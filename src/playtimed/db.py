@@ -4,6 +4,7 @@ SQLite database for playtimed activity tracking.
 Stores structured activity data for long-term metrics and analytics.
 """
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -152,6 +153,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 owner TEXT,  -- user who owns this process (NULL = all users)
                 enabled INTEGER NOT NULL DEFAULT 1,
                 cpu_threshold REAL DEFAULT 5.0,  -- minimum CPU% to count as active (0 for browser domains)
+                allowance TEXT,  -- name of the window allowance this pattern draws on (ADR-005)
 
                 -- Discovery metadata
                 discovered_cmdline TEXT,  -- original cmdline that led to discovery
@@ -204,11 +206,25 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 mode TEXT NOT NULL,              -- 'restricted' | 'open'
                 budget_minutes INTEGER,          -- NULL = uncapped
                 meters TEXT NOT NULL DEFAULT 'gaming',  -- 'gaming' | 'all'
+                allowances TEXT NOT NULL DEFAULT '{}',  -- JSON {name: minutes per hour} (ADR-005)
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_windows_user
                 ON schedule_windows(user);
+
+            -- Allowance spend: seconds a user has drawn on a named allowance
+            -- in one clock hour (ADR-005). The daemon adds one poll interval
+            -- per poll in which anything carrying the allowance was present.
+            CREATE TABLE IF NOT EXISTS allowance_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user TEXT NOT NULL,
+                allowance TEXT NOT NULL,
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                seconds INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user, allowance, date, hour)
+            );
 
             -- Indexes for common queries
             CREATE INDEX IF NOT EXISTS idx_events_user_date
@@ -508,13 +524,40 @@ def migrate_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 mode TEXT NOT NULL,              -- 'restricted' | 'open'
                 budget_minutes INTEGER,          -- NULL = uncapped
                 meters TEXT NOT NULL DEFAULT 'gaming',  -- 'gaming' | 'all'
+                allowances TEXT NOT NULL DEFAULT '{}',  -- JSON {name: minutes per hour} (ADR-005)
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_windows_user
                 ON schedule_windows(user);
+
+            -- Allowance spend: seconds a user has drawn on a named allowance
+            -- in one clock hour (ADR-005). The daemon adds one poll interval
+            -- per poll in which anything carrying the allowance was present.
+            CREATE TABLE IF NOT EXISTS allowance_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user TEXT NOT NULL,
+                allowance TEXT NOT NULL,
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                seconds INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user, allowance, date, hour)
+            );
         """)
         _migrate_windows(conn)
+
+        # ADR-005: allowances — a rationed exception inside a restricted window.
+        cursor = conn.execute("PRAGMA table_info(schedule_windows)")
+        if 'allowances' not in {row[1] for row in cursor.fetchall()}:
+            conn.execute("ALTER TABLE schedule_windows ADD COLUMN "
+                         "allowances TEXT NOT NULL DEFAULT '{}'")
+        cursor = conn.execute("PRAGMA table_info(process_patterns)")
+        if 'allowance' not in {row[1] for row in cursor.fetchall()}:
+            conn.execute("ALTER TABLE process_patterns ADD COLUMN allowance TEXT")
+
+        # Templates added after a host was first seeded would otherwise fall
+        # back to the router's plain wording forever.
+        _seed_default_templates(conn, only_missing=True)
 
 
 
@@ -549,9 +592,18 @@ def _migrate_windows(conn):
                   w.budget_minutes, w.meters, now, now))
 
 
-def _seed_default_templates(conn):
-    """Seed default message templates."""
+def _seed_default_templates(conn, only_missing: bool = False):
+    """Seed default message templates.
+
+    With ``only_missing``, intentions that already have any template are
+    left alone, so an operator's edits survive and a new intention still
+    gets its defaults.
+    """
     now = datetime.now().isoformat()
+    present = set()
+    if only_missing:
+        present = {row[0] for row in conn.execute(
+            "SELECT DISTINCT intention FROM message_templates").fetchall()}
 
     templates = [
         # process_start - when a tracked game begins
@@ -656,9 +708,27 @@ def _seed_default_templates(conn):
         ('strict_warning', 0, 'Unknown application',
          'I do not recognize {process}. It will be closed in {grace_seconds} seconds unless approved.',
          'dialog-warning', 'critical'),
+
+        # allowance_expired - a rationed app has used its minutes for this hour
+        ('allowance_expired', 0, 'That is your {process} for this hour',
+         ('You have had your {time_limit} minutes of {process}. Closing it in '
+          '{grace_seconds} seconds; it comes back at the top of the hour.'),
+         'dialog-warning', 'critical'),
+        ('allowance_expired', 1, '{process} break is over',
+         ('{time_limit} minutes of {process} used up for this hour, {user}. '
+          '{grace_seconds} seconds to say goodbye. Back at the next hour.'),
+         'dialog-warning', 'critical'),
+
+        # allowance_blocked - a rationed app was relaunched with nothing left
+        ('allowance_blocked', 0, 'Not until next hour',
+         ('{process} has used its {time_limit} minutes for this hour. '
+          'It opens again at the top of the hour.'),
+         'dialog-error', 'critical'),
     ]
 
     for intention, variant, title, body, icon, urgency in templates:
+        if intention in present:
+            continue
         conn.execute("""
             INSERT INTO message_templates (intention, variant, title, body, icon, urgency, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1345,7 +1415,8 @@ class ActivityDB:
 
         with get_connection(self.db_path) as conn:
             rows = conn.execute("""
-                SELECT id, days, start_hour, end_hour, mode, budget_minutes, meters
+                SELECT id, days, start_hour, end_hour, mode, budget_minutes, meters,
+                       allowances
                 FROM schedule_windows WHERE user = ?
                 ORDER BY start_hour, days
             """, (user,)).fetchall()
@@ -1353,7 +1424,8 @@ class ActivityDB:
         return [Window(days=r['days'], start_hour=r['start_hour'],
                        end_hour=r['end_hour'], mode=r['mode'],
                        budget_minutes=r['budget_minutes'], meters=r['meters'],
-                       id=r['id'])
+                       id=r['id'],
+                       allowances=tuple(json.loads(r['allowances'] or '{}').items()))
                 for r in rows]
 
     def set_windows(self, user: str, windows: list):
@@ -1375,10 +1447,11 @@ class ActivityDB:
                 conn.execute("""
                     INSERT INTO schedule_windows
                         (user, days, start_hour, end_hour, mode, budget_minutes,
-                         meters, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         meters, allowances, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (user, w.days, w.start_hour, w.end_hour, w.mode,
-                      w.budget_minutes, w.meters, now, now))
+                      w.budget_minutes, w.meters, json.dumps(dict(w.allowances)),
+                      now, now))
 
     def get_window_consumption(self, user: str, window, day: str | None = None) -> int:
         """Seconds already spent inside this window today.
@@ -1399,6 +1472,67 @@ class ActivityDB:
             """, (user, day, window.start_hour, window.end_hour)).fetchone()
 
         return row[0]
+
+    # --- Allowances (ADR-005) ---
+
+    def add_allowance_use(self, user: str, allowance: str, seconds: int,
+                          now: datetime | None = None) -> int:
+        """Charge ``seconds`` against an allowance in the current clock hour.
+
+        Returns the hour's running total after the charge.
+        """
+        now = now or datetime.now()
+        with get_connection(self.db_path) as conn:
+            row = conn.execute("""
+                INSERT INTO allowance_activity (user, allowance, date, hour, seconds)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user, allowance, date, hour) DO UPDATE SET
+                    seconds = seconds + excluded.seconds
+                RETURNING seconds
+            """, (user, allowance, now.date().isoformat(), now.hour, seconds)).fetchone()
+        return row[0]
+
+    def get_allowance_use(self, user: str, allowance: str,
+                          now: datetime | None = None) -> int:
+        """Seconds already drawn on an allowance in the current clock hour.
+
+        Keyed on the clock hour rather than stored as a counter, so the ration
+        renews at the top of the hour with no reset to get wrong.
+        """
+        now = now or datetime.now()
+        with get_connection(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT seconds FROM allowance_activity
+                WHERE user = ? AND allowance = ? AND date = ? AND hour = ?
+            """, (user, allowance, now.date().isoformat(), now.hour)).fetchone()
+        return row[0] if row else 0
+
+    def set_pattern_allowance(self, pattern_id: int, allowance: str | None):
+        """Attach a pattern to a named allowance, or detach it with None."""
+        now = datetime.now().isoformat()
+        with get_connection(self.db_path) as conn:
+            conn.execute("""
+                UPDATE process_patterns SET allowance = ?, updated_at = ?
+                WHERE id = ?
+            """, (allowance, now, pattern_id))
+
+    def get_allowance_patterns(self, owner: str | None = None) -> list[dict]:
+        """Every enabled, admitted pattern that draws on an allowance, any type.
+
+        A disallowed or unreviewed pattern is shut out by its state before any
+        ration is read, so it is not reported as rationed.
+        """
+        with get_connection(self.db_path) as conn:
+            conditions = ["allowance IS NOT NULL", "enabled = 1",
+                          "monitor_state IN ('active', 'ignored')"]
+            params = []
+            if owner:
+                conditions.append("(owner = ? OR owner IS NULL)")
+                params.append(owner)
+            rows = conn.execute(
+                f"SELECT * FROM process_patterns WHERE {' AND '.join(conditions)} "
+                f"ORDER BY allowance, name", params).fetchall()
+            return [dict(row) for row in rows]
 
     def get_all_monitored_users(self) -> list[str]:
         """Get list of all monitored users."""
@@ -1441,6 +1575,12 @@ class ActivityDB:
                 DELETE FROM sessions WHERE start_time < ?
             """, (sessions_cutoff,))
             deleted['sessions'] = cursor.rowcount
+
+            # Allowance spend only matters for the hour it was drawn in.
+            cursor = conn.execute("""
+                DELETE FROM allowance_activity WHERE date < ?
+            """, (events_cutoff[:10],))
+            deleted['allowance_activity'] = cursor.rowcount
 
             # Optionally delete old summaries (usually want to keep these)
             if not keep_summaries:
