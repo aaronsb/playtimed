@@ -5,6 +5,21 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Allowances** (ADR-005) — a restricted window may grant named rations of minutes per clock hour, and a pattern draws on one by carrying its name. `mon-fri 0-16 restricted discord=5` with the Discord process and `discord.com` both attached to `discord` gives five shared minutes of Discord in every school hour, renewing with the clock
+- `playtimed patterns allowance <id> <name>` attaches a pattern; `--clear` detaches it; with no name it shows the current one. A gaming pattern is refused, since a restricted window closes games before any ration is read. `windows show` names the ration on each window that grants it, and `status` reports what is left of it this hour
+- Spend is presence, charged once per poll however many processes and tabs are open: what the ration admits is the same thing the close removes, and Discord in use idles under any CPU threshold
+- A spent ration warns, waits the strict-mode grace period, and closes every process carrying the allowance. A relaunch in the same hour is closed on sight with a notification naming when it comes back. A `discord.com` tab is withheld from the browser allowlist until the hour turns; a tab already open stays open, since managed policy applies at navigation (ADR-003)
+- A pattern carrying an allowance is rationed in every restricted window: where the window does not grant the name, the pattern is shut out rather than admitted as `productive`. Forgetting the token on one clause tightens that window rather than reopening it
+- `allowance_expired` and `allowance_blocked` notification intentions, with templates and router fallbacks
+- `blocked_allowance` audit events record each close made under a ration, and whether it was spent or ungranted
+
+### Changed
+- Template migration now seeds defaults for any intention that has none, in place of seeding only when the table is empty, so a host seeded under an earlier release gets new intentions without losing its edits
+- `playtimed browser-policy` lists withheld domains alongside permitted and blocked
+
 ## [0.6.1] - 2026-09-06
 
 ### Fixed

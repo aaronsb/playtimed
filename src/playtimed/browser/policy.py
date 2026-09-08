@@ -20,7 +20,10 @@ import os
 import re
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
+
+from ..windows import RESTRICTED, window_for
 
 log = logging.getLogger(__name__)
 
@@ -175,13 +178,17 @@ def _clean_domain(raw) -> str:
 UNENFORCEABLE_BUDGET_CATEGORIES = frozenset({'gaming'})
 
 
-def partition_domains(patterns: list[dict]) -> tuple[list[str], list[str]]:
+def partition_domains(patterns: list[dict],
+                      withheld: frozenset = frozenset()) -> tuple[list[str], list[str]]:
     """Split browser domain patterns into (permitted, blocked).
 
     Permitted mirrors strict mode's process admission — 'active' and 'ignored'
     — minus the gaming-category rows whose time budget cannot be enforced. A
     'discovered' domain is an unreviewed sighting and appears in neither list,
     which under an allowlist means it is unreachable.
+
+    ``withheld`` names domains whose allowance is spent or not granted this
+    hour (ADR-005); they are blocked whatever their state.
     """
     permitted, blocked = [], []
     for p in patterns:
@@ -194,7 +201,7 @@ def partition_domains(patterns: list[dict]) -> tuple[list[str], list[str]]:
         unenforceable_budget = (state == 'active'
                                 and category in UNENFORCEABLE_BUDGET_CATEGORIES)
 
-        if state == 'disallowed' or unenforceable_budget:
+        if state == 'disallowed' or unenforceable_budget or domain in withheld:
             blocked.append(domain)
         elif state in ('active', 'ignored'):
             permitted.append(domain)
@@ -279,13 +286,54 @@ def _browser_installed(policy_dir: str, commands: tuple) -> bool:
     return any(shutil.which(cmd) for cmd in commands)
 
 
+def withheld_domains(db, now: datetime | None = None) -> frozenset:
+    """Allowance-carrying domains that must be blocked right now (ADR-005).
+
+    A domain that draws on an allowance is admitted in a restricted window only
+    while its owner's window grants that allowance and the hour's ration is
+    unspent. Managed policy is machine-wide, so a domain with no owner is
+    checked against every monitored user and withheld if any of them would
+    withhold it — the same most-restrictive rule ADR-004 applies to the mode.
+    """
+    now = now or datetime.now()
+    patterns = [p for p in db.get_allowance_patterns()
+                if p.get('pattern_type') == 'browser_domain']
+    if not patterns:
+        return frozenset()
+
+    users = db.get_all_monitored_users()
+    windows = {}
+    withheld = set()
+
+    for p in patterns:
+        domain = _clean_domain(p.get('pattern'))
+        if not domain:
+            continue
+        name = p['allowance']
+        owners = [p['owner']] if p.get('owner') else users
+
+        for user in owners:
+            if user not in windows:
+                windows[user] = db.get_windows(user)
+            window = window_for(windows[user], now.weekday(), now.hour)
+            if window is None or window.mode != RESTRICTED:
+                continue
+            grant = window.allowance(name)
+            if grant is None or db.get_allowance_use(user, name, now) >= grant * 60:
+                withheld.add(domain)
+                break
+
+    return frozenset(withheld)
+
+
 def plan_policies(mode: str, patterns: list[dict],
-                  targets: list[PolicyTarget] | None = None) -> list[PolicyPlan]:
+                  targets: list[PolicyTarget] | None = None,
+                  withheld: frozenset = frozenset()) -> list[PolicyPlan]:
     """Build the policy plan for every installed browser."""
     if targets is None:
         targets = detect_targets()
 
-    permitted, blocked = partition_domains(patterns)
+    permitted, blocked = partition_domains(patterns, withheld)
 
     if mode == 'strict':
         reason = f'strict mode: allowlist of {len(permitted)} domain(s)'
@@ -358,8 +406,13 @@ def _file_matches(path: str, desired: str) -> bool:
         return False
 
 
-def sync(db, mode: str | None = None) -> list[str]:
+def sync(db, mode: str | None = None,
+         withheld: frozenset | None = None) -> list[str]:
     """Regenerate every browser policy from the database. Returns action log.
+
+    `withheld` is the set of allowance-carrying domains to block this hour
+    (ADR-005); the daemon passes the one it has already computed, and anyone
+    else leaves it unset to have it derived from the schedule and the spend.
 
     `mode` is the enforcement mode to render. The daemon passes the one it is
     running in; the CLI, which has no daemon to ask, leaves it unset and the
@@ -376,4 +429,6 @@ def sync(db, mode: str | None = None) -> list[str]:
     if mode is None:
         mode = db.get_effective_mode()
     patterns = db.get_browser_patterns(include_all_states=True)
-    return apply_plans(plan_policies(mode, patterns))
+    if withheld is None:
+        withheld = withheld_domains(db) if mode == 'strict' else frozenset()
+    return apply_plans(plan_policies(mode, patterns, withheld=withheld))

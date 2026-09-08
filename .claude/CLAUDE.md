@@ -11,6 +11,9 @@
 - [x] Process discovery workflow — promote, ignore, disallow
 - [x] Window schedules — hours tile the week, each window carrying a mode
       and an optional budget scoped to that window (ADR-004)
+- [x] Allowances — a restricted window grants named rations of minutes per
+      clock hour; patterns draw on one by name, so the Discord app and
+      discord.com share five minutes an hour during school time (ADR-005)
 - [x] Browser domain tracking for Chrome and Firefox via window titles (ADR-001)
 - [x] Browser managed-policy generation — the browser enforces URL rules from
       the domains in the database (ADR-003)
@@ -114,6 +117,12 @@ playtimed windows set anders 'mon-fri 0-15 restricted; mon-fri 15-18 open:60; \
 
 # Unlisted hours fill as restricted, and a set that does not tile is refused.
 playtimed windows preset anders school
+
+# An allowance is a trailing '<name>=<minutes per hour>' on a restricted
+# clause. Patterns draw on it by name, and patterns sharing a name share it.
+playtimed windows set anders 'mon-fri 0-16 restricted discord=5; ...'
+playtimed patterns allowance 86 discord      # the Discord process
+playtimed patterns allowance 13 discord      # discord.com
 ```
 
 ## Personality Guidelines

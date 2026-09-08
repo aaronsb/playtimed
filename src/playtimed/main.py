@@ -358,6 +358,13 @@ class ClaudeDaemon:
         # Strict mode pending kills: {pid: {'name': str, 'warned_at': time, 'user': str}}
         self.strict_pending: dict[int, dict] = {}
 
+        # Allowances spent this hour (ADR-005):
+        # {(user, allowance): {'warned_at': time, 'hour': (date, hour), 'killed': bool}}
+        self.allowance_pending: dict[tuple[str, str], dict] = {}
+
+        # Domains the browser policy withholds by allowance, as of its last write.
+        self.withheld_domains: frozenset = frozenset()
+
         # Browser monitors per user: {user: BrowserMonitor}
         self.browser_monitors: dict[str, BrowserMonitor] = {}
 
@@ -463,10 +470,35 @@ class ClaudeDaemon:
     def _sync_browser_policy(self):
         """Regenerate browser managed-policy files from the database."""
         try:
-            for action in browser_policy.sync(self.db, self.mode):
+            withheld = self._withheld_domains()
+            # Recorded before the write so a failure does not re-trigger every
+            # poll; the periodic reload retries the write regardless.
+            self.withheld_domains = withheld
+            for action in browser_policy.sync(self.db, self.mode, withheld):
                 log.info("Browser policy: %s", action)
         except Exception as e:
             log.warning("Browser policy sync failed: %s", e)
+
+    def _withheld_domains(self) -> frozenset:
+        """Domains whose allowance is spent or ungranted this hour (ADR-005)."""
+        if self.mode != 'strict':
+            return frozenset()
+        return browser_policy.withheld_domains(self.db)
+
+    def _apply_allowance_policy(self):
+        """Rewrite the browser policy when an allowance runs out or renews.
+
+        The browser enforces domain rules, so a spent allowance has to reach
+        it as a policy change. Checked every poll because the thing that
+        changes it is either the clock or the spend.
+        """
+        withheld = self._withheld_domains()
+        if withheld == self.withheld_domains:
+            return
+        log.info("Allowance withholds %s (was %s)",
+                 ', '.join(sorted(withheld)) or 'nothing',
+                 ', '.join(sorted(self.withheld_domains)) or 'nothing')
+        self._sync_browser_policy()
 
     def _load_config(self, path: str) -> dict:
         """Load configuration from YAML file."""
@@ -650,6 +682,14 @@ class ClaudeDaemon:
         # Track which PIDs are still running (for strict mode cleanup)
         seen_pids = set()
 
+        # Allowances only ration a restricted window (ADR-005). Sightings are
+        # collected across processes and domains and charged once per poll,
+        # since Discord is several processes and possibly a tab as well.
+        window = self._current_window(user)
+        rationed = (window is not None and window.mode == RESTRICTED
+                    and self.mode != 'passthrough')
+        seen_allowances: dict[str, dict] = {}
+
         for proc in psutil.process_iter(['pid', 'name', 'username', 'cmdline']):
             try:
                 if proc.info['username'] != user:
@@ -709,6 +749,14 @@ class ClaudeDaemon:
                     if pid in self.strict_pending and strict_admits(state):
                         del self.strict_pending[pid]
 
+                    if rationed and matched_pattern.get('allowance') and strict_admits(state):
+                        sighting = seen_allowances.setdefault(
+                            matched_pattern['allowance'],
+                            {'label': matched_pattern['name'], 'procs': []})
+                        sighting['procs'].append(ProcessMatch(
+                            pid=pid, name=proc_name, category="allowance",
+                            cmdline=cmdline[:100], cpu_percent=cpu))
+
                     # Matching a pattern is not the same as being admitted. A
                     # 'discovered' match takes the same warn-then-kill path as a
                     # process with no pattern at all. 'disallowed' is already
@@ -748,11 +796,84 @@ class ClaudeDaemon:
                         # Track runtime for all browser domains (like process patterns)
                         self.db.add_runtime(pattern['id'], poll_interval)
 
+                        if rationed and pattern.get('allowance'):
+                            seen_allowances.setdefault(
+                                pattern['allowance'],
+                                {'label': pattern['name'], 'procs': []})
+
                         # Notify about newly discovered domains
                         if info.get('is_new'):
                             self.router.discovery(user, domain)
             except Exception as e:
                 log.debug(f"Browser scan failed for {user}: {e}")
+
+        if rationed:
+            self._meter_allowances(user, window, seen_allowances,
+                                   poll_interval, grace_seconds)
+
+    def _meter_allowances(self, user: str, window, seen: dict,
+                          poll_interval: int, grace_seconds: int,
+                          now: datetime | None = None):
+        """Charge this poll against each allowance seen, and enforce the spent ones.
+
+        Presence is what is metered, whatever the CPU: what the ration admits
+        is the same thing the kill removes. A spent allowance gets one warning
+        and a grace period; anything still present after that is closed, and
+        a relaunch within the same hour is closed on sight. The ration renews
+        with the clock hour, which is also when pending entries are forgotten.
+        """
+        now = now or datetime.now()
+        bucket = (now.date().isoformat(), now.hour)
+        for key in [k for k, v in self.allowance_pending.items() if v['hour'] != bucket]:
+            del self.allowance_pending[key]
+
+        for name, sighting in seen.items():
+            label, procs = sighting['label'], sighting['procs']
+            grant = window.allowance(name)
+
+            if grant is None:
+                # Carrying an allowance this window does not grant means the
+                # window shuts it out, the same as any other unadmitted thing.
+                for proc in procs:
+                    log.info(f"Closing {proc.name} (PID {proc.pid}): "
+                             f"allowance {name!r} not granted {window.label()}")
+                    self.db.log_event(user, "blocked_allowance", app=proc.name,
+                                      pid=proc.pid, details=f"{name}: not granted")
+                    self._kill_process(proc, user, notify=False)
+                if procs:
+                    self.router.blocked_launch(user, label)
+                continue
+
+            used = self.db.add_allowance_use(user, name, poll_interval, now)
+            if used < grant * 60:
+                continue
+
+            key = (user, name)
+            pending = self.allowance_pending.get(key)
+            if pending is None:
+                self.allowance_pending[key] = {
+                    'warned_at': now.timestamp(), 'hour': bucket, 'killed': False,
+                    'warned_pids': {p.pid for p in procs}}
+                log.info(f"Allowance {name!r} spent for {user} "
+                         f"({used}s of {grant} min this hour) - closing in {grace_seconds}s")
+                self.db.log_event(user, "allowance_expired", app=label,
+                                  details=f"{name}: {grant} min/hr")
+                self.router.allowance_expired(user, label, grant, grace_seconds)
+                continue
+
+            if not pending['killed'] and now.timestamp() - pending['warned_at'] < grace_seconds:
+                continue
+
+            for proc in procs:
+                log.info(f"Closing {proc.name} (PID {proc.pid}): allowance {name!r} spent")
+                self.db.log_event(user, "blocked_allowance", app=proc.name,
+                                  pid=proc.pid, details=f"{name}: {grant} min/hr spent")
+                self._kill_process(proc, user, notify=False)
+            # The warning already announced the close of what was running then.
+            # Anything launched since gets told why it went.
+            if any(p.pid not in pending['warned_pids'] for p in procs):
+                self.router.allowance_blocked(user, label, grant)
+            pending['killed'] = True
 
     def _handle_strict_unknown(self, user: str, proc_name: str, cmdline: str,
                                 pid: int, cpu: float, grace_seconds: int):
@@ -1254,6 +1375,11 @@ class ClaudeDaemon:
                 except Exception:
                     log.exception("Error processing user %s", user)
 
+            try:
+                self._apply_allowance_policy()
+            except Exception:
+                log.exception("Error applying allowance policy")
+
             time.sleep(poll_interval)
 
         # Save all state on exit
@@ -1298,6 +1424,16 @@ def _get_user_status_row(db, user: str) -> dict:
     remaining = max(0, limit - used) if limit else 0
     pct = int(used / limit * 100) if limit else 0
 
+    allowances = []
+    if window is not None and window.mode == RESTRICTED:
+        for name, minutes in window.allowances:
+            spent = db.get_allowance_use(user, name, now)
+            allowances.append({
+                'name': name,
+                'minutes': minutes,
+                'left': max(0, minutes * 60 - spent),
+            })
+
     return {
         'user': user,
         'window': label,
@@ -1307,6 +1443,7 @@ def _get_user_status_row(db, user: str) -> dict:
         'remaining': format_duration(remaining) if limit else 'uncapped',
         'pct': pct,
         'total_used': format_duration(total_used),
+        'allowances': allowances,
     }
 
 
@@ -1380,6 +1517,10 @@ def cmd_status(args):
         if row['state'] == 'restricted':
             print(f"  {row['user']}: {row['window']} — restricted to the "
                   f"always-allowed sites")
+            for a in row['allowances']:
+                left = (Colors.ok(format_duration(a['left'])) if a['left']
+                        else Colors.warn('nothing'))
+                print(f"      {a['name']}: {left} left of {a['minutes']} min this hour")
         elif not row['capped']:
             print(f"  {row['user']}: {row['window']} — {Colors.ok('no time cap')}")
         else:
@@ -1958,6 +2099,8 @@ def cmd_patterns(args):
     """List or manage process patterns."""
     if args.action in ("add", "disable", "enable", "delete"):
         require_root(f"patterns {args.action}")
+    if args.action == "allowance" and (args.name or args.clear):
+        require_root("patterns allowance")
     if args.action == "note" and hasattr(args, 'text') and args.text:
         require_root("patterns note")
 
@@ -2005,7 +2148,8 @@ def cmd_patterns(args):
             state_color = state_colors.get(state, '')
             state_str = f"{state_color}{state}{Colors.RESET}"
 
-            print(f"{p['id']:<6} {type_str:<16} {state_str:<12} {category:<12} {owner:<10} {p['name']:<20} {runtime:<10}{enabled}")
+            allowance = Colors.dim(f" [{p['allowance']}]") if p.get('allowance') else ""
+            print(f"{p['id']:<6} {type_str:<16} {state_str:<12} {category:<12} {owner:<10} {p['name']:<20} {runtime:<10}{enabled}{allowance}")
 
         print()
         print(Colors.dim("Pattern details: playtimed patterns show <id>"))
@@ -2032,6 +2176,41 @@ def cmd_patterns(args):
         db.delete_pattern(args.id)
         print(f"Deleted pattern {args.id}")
 
+    elif args.action == "allowance":
+        from .windows import ALLOWANCE_NAME_RE
+
+        pattern = db.get_pattern_by_id(args.id)
+        if not pattern:
+            print(f"Pattern {args.id} not found.", file=sys.stderr)
+            sys.exit(1)
+
+        if args.clear:
+            db.set_pattern_allowance(args.id, None)
+            print(f"Pattern {args.id} ({pattern['name']}) no longer draws on an allowance")
+        elif not args.name:
+            current = pattern.get('allowance')
+            print(f"Pattern {args.id} ({pattern['name']}) draws on: "
+                  f"{current or Colors.dim('no allowance')}")
+            return
+        else:
+            name = args.name.lower()
+            if not ALLOWANCE_NAME_RE.match(name):
+                print(Colors.error(f"Allowance name {args.name!r} must be lowercase "
+                                   "letters, digits, '_' or '-'"), file=sys.stderr)
+                sys.exit(1)
+            if (pattern.get('category') or '').lower() == 'gaming':
+                # A restricted window closes games before any ration is read,
+                # and a gaming domain never enters the allowlist (ADR-003).
+                print(Colors.error(f"Pattern {args.id} ({pattern['name']}) is a gaming "
+                                   "pattern; a restricted window shuts games out before "
+                                   "an allowance could admit one"), file=sys.stderr)
+                sys.exit(1)
+            db.set_pattern_allowance(args.id, name)
+            print(f"Pattern {args.id} ({pattern['name']}) draws on allowance {name!r}")
+            print(Colors.dim(f"  Grant it in a restricted window: "
+                             f"playtimed windows set <user> '... restricted {name}=5'"))
+        _resync_browser_policy(db, args.id)
+
     elif args.action == "note":
         pattern = db.get_pattern_by_id(args.id)
         if not pattern:
@@ -2054,6 +2233,8 @@ def cmd_patterns(args):
             print(f"  {Colors.dim('State:')}    {pattern['monitor_state']}")
             print(f"  {Colors.dim('Category:')} {pattern.get('category') or '-'}")
             print(f"  {Colors.dim('Owner:')}    {pattern.get('owner') or '*'}")
+            if pattern.get('allowance'):
+                print(f"  {Colors.dim('Allowance:')} {pattern['allowance']}")
             if pattern_type == 'process':
                 print(f"  {Colors.dim('CPU:')}      {pattern['cpu_threshold']}%")
                 print(f"  {Colors.dim('Runs:')}     {pattern.get('unique_pid_count', 0)}")
@@ -2184,8 +2365,9 @@ def cmd_browser_policy(args):
     mode = db.get_effective_mode()
     stored = db.get_daemon_mode()
     patterns = db.get_browser_patterns(include_all_states=True)
-    permitted, blocked = browser_policy.partition_domains(patterns)
-    plans = browser_policy.plan_policies(mode, patterns)
+    withheld = browser_policy.withheld_domains(db) if mode == 'strict' else frozenset()
+    permitted, blocked = browser_policy.partition_domains(patterns, withheld)
+    plans = browser_policy.plan_policies(mode, patterns, withheld=withheld)
 
     print(Colors.header("Browser Policy"))
     print()
@@ -2193,6 +2375,9 @@ def cmd_browser_policy(args):
     print(f"  Mode:      {Colors.bold(mode)}{origin}")
     print(f"  Permitted: {', '.join(permitted) if permitted else Colors.dim('none')}")
     print(f"  Blocked:   {', '.join(blocked) if blocked else Colors.dim('none')}")
+    if withheld:
+        print(f"  Withheld:  {', '.join(sorted(withheld))}"
+              + Colors.dim("  (allowance spent or not granted this hour)"))
     print()
 
     if not plans:
@@ -2491,8 +2676,10 @@ Examples:
     windows_set.add_argument("username", help="Username")
     windows_set.add_argument(
         "spec", nargs="+",
-        help="'<days> <start>-<end> <mode>[:budget][/all]', semicolon-separated. "
-             "Example: 'mon-fri 0-15 restricted; mon-fri 15-18 open:60'")
+        help="'<days> <start>-<end> <mode>[:budget][/all] [<name>=<minutes>...]', "
+             "semicolon-separated. A restricted window may grant allowances of "
+             "minutes per hour to patterns carrying that name. "
+             "Example: 'mon-fri 0-15 restricted discord=5; mon-fri 15-18 open:60'")
 
     windows_preset = windows_sub.add_parser("preset", help="Apply a named preset")
     windows_preset.add_argument("username", help="Username")
@@ -2532,6 +2719,12 @@ Examples:
 
     del_pat = pattern_sub.add_parser("delete", help="Delete a pattern")
     del_pat.add_argument("id", type=int, help="Pattern ID")
+
+    allow_pat = pattern_sub.add_parser(
+        "allowance", help="Attach a pattern to a named allowance (ADR-005)")
+    allow_pat.add_argument("id", type=int, help="Pattern ID")
+    allow_pat.add_argument("name", nargs="?", help="Allowance name (omit to view)")
+    allow_pat.add_argument("--clear", action="store_true", help="Detach the pattern")
 
     note_pat = pattern_sub.add_parser("note", help="View or set notes on a pattern")
     note_pat.add_argument("id", type=int, help="Pattern ID")

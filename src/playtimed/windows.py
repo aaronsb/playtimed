@@ -5,10 +5,15 @@ mode and an optional budget. Windows tile the week: for every day, the windows
 covering it partition hours 0-24 with no gaps and no overlaps, so no hour can
 fall under two rules or none.
 
+A restricted window may also carry allowances (ADR-005): named rations of
+minutes per clock hour for patterns that would otherwise be shut out. A
+pattern draws on an allowance by carrying its name.
+
 Nothing here touches the database. `db.py` stores these; the daemon asks
 `window_for()` what the current hour is governed by.
 """
 
+import re
 from dataclasses import dataclass, replace
 
 DAY_NAMES = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')
@@ -28,6 +33,9 @@ EVERY_DAY = '1111111'
 #: The mode a window maps onto for the daemon and for ADR-003 policy generation.
 DAEMON_MODE = {RESTRICTED: 'strict', OPEN: 'normal'}
 
+#: An allowance name: what a pattern carries to draw on a window's ration.
+ALLOWANCE_NAME_RE = re.compile(r'^[a-z][a-z0-9_-]*$')
+
 
 @dataclass(frozen=True)
 class Window:
@@ -37,6 +45,10 @@ class Window:
     of None means uncapped. ``meters`` selects which activity the budget counts:
     ``gaming`` counts game processes and gaming-category browser domains,
     ``all`` counts every tracked second.
+
+    ``allowances`` is a sorted tuple of ``(name, minutes_per_hour)`` pairs, and
+    is only meaningful on a restricted window: an open window already admits
+    everything an allowance could grant.
     """
 
     days: str
@@ -46,6 +58,17 @@ class Window:
     budget_minutes: int | None = None
     meters: str = METER_GAMING
     id: int | None = None
+    allowances: tuple = ()
+
+    def __post_init__(self):
+        # Normalise so equal allowances compare and hash equal whatever the
+        # caller's ordering or container.
+        pairs = dict(self.allowances).items() if self.allowances else ()
+        object.__setattr__(self, 'allowances', tuple(sorted(pairs)))
+
+    def allowance(self, name: str) -> int | None:
+        """Minutes per hour this window grants ``name``, or None if it does not."""
+        return dict(self.allowances).get(name)
 
     def applies_on(self, day: int) -> bool:
         return self.days[day] == '1'
@@ -96,6 +119,15 @@ def validate(windows: list[Window]) -> list[str]:
                 f"{w.start_hour}..{w.end_hour}")
         if w.budget_minutes is not None and w.budget_minutes < 0:
             problems.append(f"negative budget {w.budget_minutes}")
+        if w.allowances and w.mode != RESTRICTED:
+            problems.append("an open window has nothing to allow")
+        for name, minutes in w.allowances:
+            if not ALLOWANCE_NAME_RE.match(name or ''):
+                problems.append(f"allowance name {name!r} must be lowercase letters, "
+                                f"digits, '_' or '-'")
+            if not isinstance(minutes, int) or not 1 <= minutes <= 60:
+                problems.append(f"allowance {name!r} must grant 1-60 minutes per hour, "
+                                f"got {minutes!r}")
 
     if problems:
         return problems
@@ -152,15 +184,17 @@ def _merge_identical(windows: list[Window]) -> list[Window]:
     """Collapse windows that differ only in which days they apply to."""
     merged: dict[tuple, list[str]] = {}
     for w in windows:
-        key = (w.start_hour, w.end_hour, w.mode, w.budget_minutes, w.meters)
+        key = (w.start_hour, w.end_hour, w.mode, w.budget_minutes, w.meters,
+               w.allowances)
         merged.setdefault(key, []).append(w.days)
 
     out = []
-    for (start, end, mode, budget, meters), day_masks in merged.items():
+    for (start, end, mode, budget, meters, allowances), day_masks in merged.items():
         days = ''.join(
             '1' if any(m[d] == '1' for m in day_masks) else '0'
             for d in range(7))
-        out.append(Window(days, start, end, mode, budget, meters))
+        out.append(Window(days, start, end, mode, budget, meters,
+                          allowances=allowances))
 
     return sorted(out, key=lambda w: (w.start_hour, w.days))
 
@@ -235,6 +269,9 @@ def describe(windows: list[Window], day: int) -> list[str]:
                     key=lambda w: w.start_hour):
         if w.mode == RESTRICTED:
             detail = 'restricted'
+            if w.allowances:
+                detail += ', ' + ', '.join(
+                    f"{name} {minutes} min/hr" for name, minutes in w.allowances)
         elif w.is_capped:
             unit = 'all activity' if w.meters == METER_ALL else 'gaming'
             detail = f"open, {w.budget_minutes} min {unit}"
@@ -279,13 +316,15 @@ def parse_days(token: str) -> str:
 def parse_spec(text: str) -> list[Window]:
     """Parse a semicolon-separated window spec.
 
-    Each clause is ``<days> <start>-<end> <mode>[:<budget>][/all]``::
+    Each clause is ``<days> <start>-<end> <mode>[:<budget>][/all] [<name>=<minutes>...]``::
 
-        mon-fri 0-15 restricted; mon-fri 15-18 open:60/gaming;
+        mon-fri 0-15 restricted discord=5; mon-fri 15-18 open:60/gaming;
         mon-fri 18-22 open; sat-sun 8-18 open:360
 
     Hours are 24-hour and the end is exclusive, so ``22-24`` runs to midnight.
     Uncovered hours are filled with restricted windows rather than left open.
+    ``name=minutes`` grants an allowance: patterns carrying ``name`` may run
+    for that many minutes in each clock hour of the window (ADR-005).
     """
     windows = []
 
@@ -295,7 +334,7 @@ def parse_spec(text: str) -> list[Window]:
             continue
 
         parts = clause.split()
-        if len(parts) != 3:
+        if len(parts) < 3:
             raise ScheduleError(
                 f"expected '<days> <start>-<end> <mode>', got {clause!r}")
 
@@ -328,13 +367,33 @@ def parse_spec(text: str) -> list[Window]:
         if rule == RESTRICTED and budget is not None:
             raise ScheduleError("a restricted window has nothing to budget")
 
-        windows.append(Window(days, start, end, rule, budget, meters))
+        allowances = [_parse_allowance(token) for token in parts[3:]]
+        names = [name for name, _ in allowances]
+        if len(set(names)) != len(names):
+            raise ScheduleError(f"allowance named twice in {clause!r}")
+
+        windows.append(Window(days, start, end, rule, budget, meters,
+                              allowances=tuple(allowances)))
 
     filled = fill_gaps(windows)
     problems = validate(filled)
     if problems:
         raise ScheduleError('; '.join(problems))
     return filled
+
+
+def _parse_allowance(token: str) -> tuple[str, int]:
+    """Turn ``discord=5`` into ``('discord', 5)``."""
+    if '=' not in token:
+        raise ScheduleError(f"expected '<name>=<minutes>', got {token!r}")
+    name, raw = token.split('=', 1)
+    name = name.strip().lower()
+    try:
+        minutes = int(raw)
+    except ValueError:
+        raise ScheduleError(
+            f"allowance {name!r} must be minutes per hour, got {raw!r}") from None
+    return name, minutes
 
 
 def to_spec(windows: list[Window]) -> str:
@@ -346,6 +405,8 @@ def to_spec(windows: list[Window]) -> str:
             rule += f":{w.budget_minutes}"
             if w.meters != METER_GAMING:
                 rule += f"/{w.meters}"
+        for name, minutes in w.allowances:
+            rule += f" {name}={minutes}"
         clauses.append(f"{_days_label(w.days)} {w.start_hour}-{w.end_hour} {rule}")
     return '; '.join(clauses)
 

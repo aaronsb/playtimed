@@ -375,6 +375,12 @@ class FakeDB:
     def get_browser_patterns(self, include_all_states=False):
         return PATTERNS
 
+    def get_allowance_patterns(self, owner=None):
+        return []
+
+    def get_all_monitored_users(self):
+        return ['anders']
+
 
 class TestSync:
     """Which mode the regenerated policy is rendered for.
@@ -389,7 +395,7 @@ class TestSync:
     def rendered(self, monkeypatch):
         modes = []
 
-        def plan(mode, patterns, targets=None):
+        def plan(mode, patterns, targets=None, withheld=frozenset()):
             modes.append(mode)
             return []
 

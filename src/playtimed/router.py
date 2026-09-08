@@ -180,6 +180,11 @@ class MessageRouter:
             'enforcement': ("Game closed", "{process} was terminated."),
             'blocked_launch': ("Blocked", "{process} cannot run right now."),
             'discovery': ("New app", "Detected {process}."),
+            'allowance_expired': ("Time is up for {process}",
+                                  ("{process} has had its {time_limit} minutes this hour. "
+                                   "Closing in {grace_seconds} seconds.")),
+            'allowance_blocked': ("Not until next hour",
+                                  "{process} is out of minutes until the top of the hour."),
         }
 
         title, body = fallbacks.get(intention, (intention, "Notification"))
@@ -317,6 +322,20 @@ class MessageRouter:
             day=datetime.now().strftime("%A"),
         )
         nid, _ = self.send('day_reset', ctx)
+        return nid
+
+    def allowance_expired(self, user: str, process: str, minutes: int,
+                          grace_seconds: int) -> int:
+        """Notify that a rationed app has used its minutes for this hour."""
+        ctx = MessageContext(user=user, process=process, time_limit=minutes,
+                             grace_seconds=grace_seconds)
+        nid, _ = self.send('allowance_expired', ctx)
+        return nid
+
+    def allowance_blocked(self, user: str, process: str, minutes: int) -> int:
+        """Notify that a rationed app was relaunched with nothing left this hour."""
+        ctx = MessageContext(user=user, process=process, time_limit=minutes)
+        nid, _ = self.send('allowance_blocked', ctx)
         return nid
 
     def mode_change(self, mode: str) -> int:

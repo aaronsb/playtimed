@@ -144,7 +144,7 @@ class TestSyncCarriesTheLiveMode:
 
         calls = []
         monkeypatch.setattr(browser_policy, 'sync',
-                            lambda db, mode=None: calls.append(mode) or [])
+                            lambda db, mode=None, withheld=None: calls.append(mode) or [])
         daemon.db = object()
         daemon.mode = 'normal'
 
