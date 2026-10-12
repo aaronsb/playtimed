@@ -5,6 +5,12 @@ All notable changes to playtimed will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The packaged unit grants `CAP_DAC_READ_SEARCH`. Without it the daemon's root cannot enter a 0700 home or `/run/user/<uid>`, so Chrome and Firefox session files and the KWin window list went unread: no tab was ever seen, browser runtime stayed at zero, and a `discord.com` tab never drew on its allowance while the Discord app did. The source-install unit also gains `CAP_SETUID` and `CAP_SETGID`, which notifications already needed
+- The daemon warns at startup when it cannot read a monitored user's home, in place of failing every browser scan silently
+
 ## [0.7.0] - 2026-09-08
 
 ### Added

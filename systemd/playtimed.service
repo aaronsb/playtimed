@@ -24,8 +24,11 @@ ReadWritePaths=-/etc/brave
 ReadWritePaths=-/etc/firefox
 PrivateTmp=true
 NoNewPrivileges=false
-# Needs to be able to kill user processes
-CapabilityBoundingSet=CAP_KILL CAP_SYS_PTRACE
+# Kill user processes, switch users for notifications, and read the user's
+# home and runtime directories. Those are 0700, and without CAP_DAC_READ_SEARCH
+# root cannot enter them: browser session files and the KWin session bus go
+# unread, so no tab is ever seen and browser allowances are never charged.
+CapabilityBoundingSet=CAP_KILL CAP_SYS_PTRACE CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH
 
 [Install]
 WantedBy=multi-user.target
