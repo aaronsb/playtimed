@@ -573,6 +573,12 @@ class ClaudeDaemon:
             uid = self._get_user_uid(user)
             if uid is None:
                 return None
+            # Every read the scan makes fails quietly at debug level, so a home
+            # the daemon cannot enter would leave browsers unwatched unnoticed.
+            home = os.path.expanduser(f"~{user}")
+            if not os.access(home, os.R_OK | os.X_OK):
+                log.warning(f"Cannot read {home}: browser tabs for {user} will not "
+                            f"be seen (the unit needs CAP_DAC_READ_SEARCH)")
             self.browser_monitors[user] = BrowserMonitor(self.db, user, uid)
         return self.browser_monitors[user]
 
